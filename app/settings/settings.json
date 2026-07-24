@@ -1,5 +1,3 @@
 {
-	"archiveSize": 500,
-	"archiveSplit": "era",
-	"retentionMonths": 1
+	"retentionMonths": 6
 }

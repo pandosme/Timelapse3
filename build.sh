@@ -1,11 +1,21 @@
 #!/bin/sh
-rm -rf build
-docker build  --progress=plain --no-cache --build-arg ARCH=aarch64 --tag acap .
-docker cp $(docker create acap):/opt/app ./build
-mv build/*.eap .
-rm -rf build
-docker build  --progress=plain --no-cache --tag acap .
-docker cp $(docker create acap):/opt/app ./build
-mv build/*.eap .
-rm -rf build
+set -eu
+
+build_arch() {
+	arch="$1"
+	tag="acap-${arch}"
+
+	rm -rf build
+	docker build --progress=plain --no-cache --build-arg ARCH="${arch}" --tag "${tag}" .
+
+	container_id="$(docker create "${tag}")"
+	docker cp "${container_id}":/opt/app ./build
+	docker rm "${container_id}" >/dev/null
+
+	mv build/*.eap .
+	rm -rf build
+}
+
+build_arch aarch64
+build_arch armv7hf
 

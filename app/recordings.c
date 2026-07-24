@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <stdbool.h>
+#include <time.h>
 #include "vdo-stream.h"
 #include "vdo-frame.h"
 #include "vdo-types.h"
@@ -14,6 +15,9 @@
 #include "cJSON.h"
 #include "recordings.h"
 #include "timelapse.h"
+#include "media.h"
+#include "recording_store.h"
+#include "storage.h"
 
 #define LOG(fmt, args...)    { syslog(LOG_INFO, fmt, ## args); printf(fmt, ## args); }
 #define LOG_WARN(fmt, args...)    { syslog(LOG_WARNING, fmt, ## args); printf(fmt, ## args); }
@@ -41,7 +45,7 @@ typedef unsigned int DWORD;
 
 struct AVI_HEADER_STRUCT {
     DWORD LIST_RIFF;      // "RIFF"
-    DWORD RIFF_size;      // 
+    DWORD RIFF_size;      //
     DWORD RIFF_FOURCC;    // "AVI "
     DWORD LIST_HDRL;      // "LIST"
     DWORD hdrl_size;      // 208
@@ -139,6 +143,69 @@ static DWORD FOURCC(const char* str) {
 
 static cJSON *ArchiveList = NULL;
 
+typedef struct {
+    char profile_id[128];
+} ResetMediaTask;
+
+static void Set_Reset_Media_Status_Active(const char* profile_id) {
+    ACAP_STATUS_SetBool("mediaJob", "active", 1);
+    ACAP_STATUS_SetString("mediaJob", "kind", "reset_media");
+    ACAP_STATUS_SetString("mediaJob", "profileId", profile_id ? profile_id : "");
+    ACAP_STATUS_SetString("mediaJob", "stage", "Resetting recording media");
+    ACAP_STATUS_SetNumber("mediaJob", "estimatedSeconds", 10.0);
+    ACAP_STATUS_SetNumber("mediaJob", "progress", 5.0);
+    ACAP_STATUS_SetString("mediaJob", "message", "Deleting captured frames and generated videos...");
+}
+
+static void Set_Reset_Media_Status_Done(int ok, const char* message) {
+    ACAP_STATUS_SetBool("mediaJob", "active", 0);
+    ACAP_STATUS_SetNumber("mediaJob", "progress", ok ? 100.0 : 0.0);
+    ACAP_STATUS_SetString("mediaJob", "message", message ? message : (ok ? "Recording media reset" : "Reset failed"));
+}
+
+static gpointer Reset_Media_Thread(gpointer user_data) {
+    ResetMediaTask* task = (ResetMediaTask*)user_data;
+    if (!task) {
+        return NULL;
+    }
+
+    LOG("%s: start profile=%s\n", __func__, task->profile_id);
+    ACAP_STATUS_SetNumber("mediaJob", "progress", 10.0);
+    if (Recordings_Clear(task->profile_id) == 0) {
+        Set_Reset_Media_Status_Done(1, "Recording media reset");
+        LOG("%s: done profile=%s\n", __func__, task->profile_id);
+    } else {
+        Set_Reset_Media_Status_Done(0, "Failed to reset recording media");
+        LOG_WARN("%s: failed profile=%s\n", __func__, task->profile_id);
+    }
+
+    g_free(task);
+    return NULL;
+}
+
+static int Queue_Reset_Media(const char* profile_id) {
+    if (!profile_id || !profile_id[0]) {
+        return 0;
+    }
+
+    ResetMediaTask* task = g_new0(ResetMediaTask, 1);
+    if (!task) {
+        return 0;
+    }
+
+    snprintf(task->profile_id, sizeof(task->profile_id), "%s", profile_id);
+    Set_Reset_Media_Status_Active(profile_id);
+
+    GThread* thread = g_thread_new("reset-media", Reset_Media_Thread, task);
+    if (!thread) {
+        g_free(task);
+        Set_Reset_Media_Status_Done(0, "Failed to start media reset");
+        return 0;
+    }
+    g_thread_unref(thread);
+    return 1;
+}
+
 static void write_avi_header(FILE* f, DWORD frames, DWORD totalJPEGSize, DWORD width, DWORD height, unsigned int fps);
 static size_t write_avi_frame(FILE* f, const unsigned char* data, size_t size);
 static int avi_add_index_entry(FILE* file, unsigned int frame, unsigned int jpeg_size);
@@ -152,6 +219,17 @@ static void load_archive_list();
 static void save_archive_list();
 static void update_avi_fps(FILE* f, unsigned int fps);
 int Recordings_Delete_Archive(const char* filename);
+
+static int stream_file_response(const ACAP_HTTP_Response response, const char* path, const char* content_type, const char* disposition, const char* filename);
+static void normalize_mp4_filename(char* out, size_t out_len, const char* filename);
+
+static long long monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return ((long long)ts.tv_sec * 1000LL) + (ts.tv_nsec / 1000000LL);
+}
 
 //pthread_mutex_t recordings_mutex = //pthread_mutex_INITIALIZER;
 
@@ -238,12 +316,12 @@ static void write_avi_header(FILE* f, DWORD frames, DWORD totalJPEGSize, DWORD w
 
 static int avi_initialize_index(FILE* file) {
     AVIOLDINDEX header;
-    
+
     if (!file) return 0;
-    
+
     header.fourCC = FOURCC("idx1");
     header.cb = LILEND4(0);  // Initial size is 0
-	fseek(file, 0, SEEK_SET);    
+	fseek(file, 0, SEEK_SET);
     return fwrite(&header, sizeof(AVIOLDINDEX), 1, file) == 1;
 }
 
@@ -282,26 +360,26 @@ static int avi_add_index_entry(FILE* file, unsigned int frames, unsigned int jpe
 
 static size_t write_avi_frame(FILE* f, const unsigned char* data, size_t size) {
     // Calculate padding needed for 4-byte alignment
-	fseek(f, 0, SEEK_END);	
+	fseek(f, 0, SEEK_END);
     unsigned int padding = (4-(size%4)) % 4;
     size_t total_size = size + padding;
 
 	LOG_TRACE("%s:\n",__func__);
 
-    
+
     LIST_INDEX lindex;
     lindex.fourCC = FOURCC("00db");
     lindex.size = LILEND4(size);
-    
+
     fwrite(&lindex, sizeof(LIST_INDEX), 1, f);
     fwrite((void*)data, 1, size, f);
-    
+
     // Write padding if needed
     if (padding > 0) {
         char pad[4] = {0};
         fwrite(pad, 1, padding, f);
     }
-    
+
     return total_size;
 }
 
@@ -309,10 +387,9 @@ static size_t write_avi_frame(FILE* f, const unsigned char* data, size_t size) {
 static void ensure_profile_directory(const char* profileId) {
 
     char path[PATH_MAX_LEN];
-    sprintf(path, "/var/spool/storage/SD_DISK/timelapse2/%s", profileId);
-    struct stat st = {0};
-    if (stat(path, &st) == -1) {
-        mkdir(path, 0755);
+    char error[256];
+    if (storage_profile_dir(path, sizeof(path), profileId)) {
+        storage_ensure_directory(path, error, sizeof(error));
     }
 }
 
@@ -327,32 +404,34 @@ static void ensure_directory(const char *path) {
 static cJSON* load_recordings(void) {
 	//pthread_mutex_lock(&recordings_mutex);
     char path[PATH_MAX_LEN];
-    sprintf(path, "/var/spool/storage/SD_DISK/timelapse2/recordings.json");
-    
-    FILE* file = fopen(path, "r");
-    if (!file) {
-		//pthread_mutex_unlock(&recordings_mutex);		
+    if (!storage_recordings_path(path, sizeof(path))) {
         return cJSON_CreateObject();
     }
-    
+
+    FILE* file = fopen(path, "r");
+    if (!file) {
+		//pthread_mutex_unlock(&recordings_mutex);
+        return cJSON_CreateObject();
+    }
+
     fseek(file, 0, SEEK_END);
     long size = ftell(file);
     fseek(file, 0, SEEK_SET);
-    
+
     char* json = malloc(size + 1);
     if (!json) {
         fclose(file);
-		//pthread_mutex_unlock(&recordings_mutex);		
+		//pthread_mutex_unlock(&recordings_mutex);
         return cJSON_CreateObject();
     }
-    
+
     fread(json, 1, size, file);
     json[size] = 0;
     fclose(file);
-    
+
     cJSON* recordings = cJSON_Parse(json);
     free(json);
-	//pthread_mutex_unlock(&recordings_mutex);    
+	//pthread_mutex_unlock(&recordings_mutex);
     return recordings ? recordings : cJSON_CreateObject();
 }
 
@@ -360,11 +439,13 @@ static void save_recordings(void) {
 	LOG_TRACE("%s: Entry",__func__);
 	//pthread_mutex_lock(&recordings_mutex);
     char path[PATH_MAX_LEN];
-    sprintf(path, "/var/spool/storage/SD_DISK/timelapse2/recordings.json");
-    
+    if (!storage_recordings_path(path, sizeof(path))) {
+        return;
+    }
+
     char* json = cJSON_PrintUnformatted(Recordings_Container);
     if (!json) return;
-    
+
     FILE* file = fopen(path, "w");
     if (file) {
         fwrite(json, strlen(json), 1, file);
@@ -388,22 +469,22 @@ static int append_file(const char *source, const char *destination) {
     long aviSize = ftell(dest);
     fseek(src, 0, SEEK_END);
     long idxSize = ftell(src);
-    
+
     // Update RIFF size in header
     fseek(dest, 4, SEEK_SET);
     DWORD newSize = LILEND4(aviSize + idxSize - 8);
     fwrite(&newSize, sizeof(DWORD), 1, dest);
-    
+
     // Append index data at end
     fseek(dest, aviSize, SEEK_SET);
     fseek(src, 0, SEEK_SET);
-    
+
     char buffer[65536];
     size_t bytesRead;
     while ((bytesRead = fread(buffer, 1, sizeof(buffer), src)) > 0) {
         fwrite(buffer, 1, bytesRead, dest);
     }
-    
+
     fclose(src);
     fclose(dest);
     return 0;
@@ -421,7 +502,11 @@ static void replace_spaces_with_underscores(char *str) {
 static void load_archive_list() {
 	LOG_TRACE("%s: Entry",__func__);
     char path[PATH_MAX_LEN];
-    snprintf(path, sizeof(path), "/var/spool/storage/SD_DISK/timelapse2/archive/recordings.json");
+    if (!storage_archive_index_path(path, sizeof(path))) {
+        LOG_WARN("%s: Failed to build archive index path\n", __func__);
+        ArchiveList = cJSON_CreateArray();
+        return;
+    }
 
     FILE *file = fopen(path, "r");
     if (!file) {
@@ -457,8 +542,19 @@ static void load_archive_list() {
 // Function to save the archive list to recordings.json
 static void save_archive_list() {
 	LOG_TRACE("%s: Entry",__func__);
+    char archive_dir[PATH_MAX_LEN];
     char path[PATH_MAX_LEN];
-    snprintf(path, sizeof(path), "/var/spool/storage/SD_DISK/timelapse2/archive/recordings.json");
+    char error[256];
+    if (!storage_archive_dir(archive_dir, sizeof(archive_dir)) ||
+        !storage_archive_index_path(path, sizeof(path))) {
+        LOG_WARN("%s: Failed to build archive index path\n", __func__);
+        return;
+    }
+
+    if (!storage_ensure_directory(archive_dir, error, sizeof(error))) {
+        LOG_WARN("%s: Failed to prepare archive directory: %s\n", __func__, error);
+        return;
+    }
 
     char *jsonString = cJSON_PrintUnformatted(ArchiveList);
     if (!jsonString) {
@@ -487,12 +583,12 @@ static void Retention_Cleanup() {
 
     // Get current time
     time_t now = time(NULL);
-    
+
     // Load archive list if not loaded
     if (!ArchiveList) {
         load_archive_list();
     }
-	
+
     if (!ArchiveList) return;
 
     // Check each archive
@@ -515,47 +611,64 @@ static void Retention_Cleanup() {
     }
 }
 
+static int days_in_month(int year, int month) {
+    static const int days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (month == 2) {
+        int leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        return leap ? 29 : 28;
+    }
+    if (month < 1 || month > 12) {
+        return 31;
+    }
+    return days[month - 1];
+}
+
+static const char* profile_archive_schedule(cJSON* profile) {
+    const char* schedule = cJSON_GetStringValue(profile ? cJSON_GetObjectItem(profile, "archiveSchedule") : NULL);
+    if (!schedule) {
+        return "monthly";
+    }
+    if (strcmp(schedule, "none") == 0 || strcmp(schedule, "daily") == 0 || strcmp(schedule, "weekly") == 0 || strcmp(schedule, "monthly") == 0) {
+        return schedule;
+    }
+    return "monthly";
+}
+
+static int recording_due_for_archive(const char* profile_id, cJSON* recording, GDateTime* now) {
+    cJSON* first = recording ? cJSON_GetObjectItem(recording, "first") : NULL;
+    if (!profile_id || !first || first->valuedouble <= 0 || !now) {
+        return 0;
+    }
+
+    cJSON* profile = Timelapse_Find_Profile_By_Id(profile_id);
+    if (!profile) {
+        LOG_WARN("%s: No profile found for active recording %s\n", __func__, profile_id);
+        return 0;
+    }
+
+    const char* schedule = profile_archive_schedule(profile);
+    if (strcmp(schedule, "none") == 0) {
+        return 0;
+    }
+
+    if (strcmp(schedule, "daily") == 0) {
+        return 1;
+    }
+
+    if (strcmp(schedule, "weekly") == 0) {
+        return g_date_time_get_day_of_week(now) == 7;
+    }
+
+    int year = g_date_time_get_year(now);
+    int month = g_date_time_get_month(now);
+    int day = g_date_time_get_day_of_month(now);
+    return day == days_in_month(year, month);
+}
+
 int Recordings_Clear(const char* profileId) {
-	//pthread_mutex_lock(&recordings_mutex);
-    if (!profileId) {
-        LOG_WARN("Invalid profile ID\n");
-		//pthread_mutex_unlock(&recordings_mutex);		
-        return -1;
-    }
-
-    char path[PATH_MAX_LEN];
-    sprintf(path, "/var/spool/storage/SD_DISK/timelapse2/%s", profileId);
-    
-    // Remove all files in directory
-    DIR* dir = opendir(path);
-    if (dir) {
-        struct dirent* entry;
-        while ((entry = readdir(dir))) {
-            if (strcmp(entry->d_name, ".") == 0 || 
-                strcmp(entry->d_name, "..") == 0)
-                continue;
-                
-            char filepath[PATH_MAX_LEN];
-            sprintf(filepath, "%s/%s", path, entry->d_name);
-            unlink(filepath);
-        }
-        closedir(dir);
-        
-        // Remove the directory itself
-        rmdir(path);
-    }
-
-    // Remove from recordings container
-    if (!Recordings_Container) {
-        load_recordings();
-    }
-    cJSON_DeleteItemFromObject(Recordings_Container, profileId);
-    save_recordings();
-
-    // Recreate the directory for new recording
-    ensure_profile_directory(profileId);
-	//pthread_mutex_unlock(&recordings_mutex);
-    return 0;
+    int result = recording_store_clear(profileId);
+    Recordings_Container = recording_store_list();
+    return result ? 0 : -1;
 }
 
 static void update_avi_fps(FILE* f, unsigned int fps) {
@@ -564,217 +677,127 @@ static void update_avi_fps(FILE* f, unsigned int fps) {
     fseek(f, offsetof(AVI_HEADER, AVIH_MicroSecPerFrame), SEEK_SET);
     DWORD usec = LILEND4(1000000/fps);
     fwrite(&usec, sizeof(DWORD), 1, f);
-    
+
     // Update rate in stream header
     fseek(f, offsetof(AVI_HEADER, strh_rate), SEEK_SET);
     DWORD rate = LILEND4(fps);
     fwrite(&rate, sizeof(DWORD), 1, f);
 }
 
-cJSON* Recordings_Get_List(void) {
-    if (!Recordings_Container) {
-        load_recordings();
+static void normalize_mp4_filename(char* out, size_t out_len, const char* filename) {
+    if (!out || out_len == 0) return;
+
+    const char* source = filename && filename[0] ? filename : "timelapse.mp4";
+    snprintf(out, out_len, "%s", source);
+
+    char* extension = strrchr(out, '.');
+    if (extension) {
+        snprintf(extension, out_len - (size_t)(extension - out), ".mp4");
+    } else {
+        size_t len = strlen(out);
+        if (len + 4 < out_len) {
+            strcat(out, ".mp4");
+        }
     }
+}
+
+static int stream_file_response(const ACAP_HTTP_Response response, const char* path, const char* content_type, const char* disposition, const char* filename) {
+    long long started_ms = monotonic_ms();
+    LOG("%s: start path=%s disposition=%s filename=%s\n", __func__, path ? path : "(null)", disposition ? disposition : "(null)", filename ? filename : "(null)");
+
+    FILE* file = fopen(path, "rb");
+    if (!file) {
+        LOG_WARN("%s: open failed path=%s err=%s\n", __func__, path ? path : "(null)", strerror(errno));
+        ACAP_HTTP_Respond_Error(response, 404, "File not found");
+        return 0;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    ACAP_HTTP_Respond_String(response, "status: 200 OK\r\n");
+    ACAP_HTTP_Respond_String(response, "Content-Type: %s\r\n", content_type);
+    ACAP_HTTP_Respond_String(response, "Content-Disposition: %s; filename=%s\r\n", disposition, filename);
+    ACAP_HTTP_Respond_String(response, "Content-Length: %ld\r\n", file_size);
+    ACAP_HTTP_Respond_String(response, "\r\n");
+
+    char* buffer = malloc(65536);
+    if (!buffer) {
+        fclose(file);
+        ACAP_HTTP_Respond_Error(response, 500, "Memory allocation failed");
+        return 0;
+    }
+
+    size_t bytes_read;
+    long long bytes_sent = 0;
+    while ((bytes_read = fread(buffer, 1, 65536, file)) > 0) {
+        if (ACAP_HTTP_Respond_Data(response, bytes_read, buffer) != 1) {
+            LOG_WARN("%s: short send path=%s bytes_sent=%lld\n", __func__, path ? path : "(null)", bytes_sent);
+            break;
+        }
+        bytes_sent += (long long)bytes_read;
+    }
+
+    free(buffer);
+    fclose(file);
+    LOG("%s: done path=%s size=%ld bytes_sent=%lld elapsed_ms=%lld\n",
+        __func__, path ? path : "(null)", file_size, bytes_sent, monotonic_ms() - started_ms);
+    return 1;
+}
+
+cJSON* Recordings_Get_List(void) {
+    Recordings_Container = recording_store_list();
     return Recordings_Container;
 }
 
 cJSON* Recordings_Get_Metadata(const char* profileId) {
-    if (!Recordings_Container) {
-        load_recordings();
-    }
-    return cJSON_GetObjectItem(Recordings_Container, profileId);
+    return recording_store_get(profileId);
 }
 
 int Recordings_Capture(cJSON* profile) {
-	//pthread_mutex_lock(&recordings_mutex);
-
-    if (!profile) return -1;
-    const char* profileId = cJSON_GetObjectItem(profile, "id") ? cJSON_GetObjectItem(profile, "id")->valuestring : NULL;
-    const char* resolution = cJSON_GetObjectItem(profile, "resolution") ? cJSON_GetObjectItem(profile, "resolution")->valuestring : NULL;
-    if (!profileId || !resolution) return -1;
-
-
-	LOG_TRACE("%s: ID=%s Resolution=%s\n",__func__,profileId,resolution);
-
-    // Parse resolution
-    char* width_str = strdup(resolution);
-    char* height_str = strchr(width_str, 'x');
-    if (height_str) {
-        *height_str = '\0';
-        height_str++;
-    }
-    int width = width_str ? atoi(width_str) : 1920;
-    int height = height_str ? atoi(height_str) : 1080;
-    free(width_str);
-
-    // Capture image using VDO
-    VdoMap* vdoSettings = vdo_map_new();
-    vdo_map_set_uint32(vdoSettings, "format", VDO_FORMAT_JPEG);
-    vdo_map_set_uint32(vdoSettings, "width", width);
-    vdo_map_set_uint32(vdoSettings, "height", height);
-    if (cJSON_GetObjectItem(profile, "overlay") && 
-        cJSON_GetObjectItem(profile, "overlay")->type == cJSON_True) {
-        vdo_map_set_string(vdoSettings, "overlays", "all,sync");
-    }
-
-    GError* error = NULL;
-    VdoBuffer* buffer = vdo_stream_snapshot(vdoSettings, &error);
-    g_clear_object(&vdoSettings);
-    if (error != NULL) {
-        LOG_WARN("%s: Snapshot capture failed: %s\n", __func__, error->message);
-        g_error_free(error);
-		//pthread_mutex_unlock(&recordings_mutex);		
-        return -1;
-    }
-
-    // Get image data
-    unsigned char* jpegData = vdo_buffer_get_data(buffer);
-    unsigned int jpegSize = vdo_frame_get_size(buffer);
-
-	if(!jpegData || ! jpegSize ) {
-		LOG_WARN("%s: Invalid capture data\n",__func__);
-		//pthread_mutex_unlock(&recordings_mutex);		
-		return -1;
-	}
-
-    // Ensure directory exists
-    ensure_profile_directory(profileId);
-
-    double timestamp = ACAP_DEVICE_Timestamp();
-
-    // Load metadata to get current frame count and total size
-    if (!Recordings_Container) {
-        load_recordings();
-    }
-
-    unsigned int frames = 0;
-    unsigned int fps = cJSON_GetObjectItem(profile,"fps")?cJSON_GetObjectItem(profile,"fps")->valueint:10;
-    DWORD totalJPEGSize = 0;
-
-    cJSON* recording = cJSON_GetObjectItem(Recordings_Container, profileId);
-	
-    if (!recording) {
-        recording = cJSON_CreateObject();
-        cJSON_AddItemToObject(Recordings_Container, profileId, recording);
-        cJSON_AddNumberToObject(recording, "images", 0);
-        cJSON_AddNumberToObject(recording, "size", 0);
-        cJSON_AddNumberToObject(recording, "first", timestamp);
-        cJSON_AddNumberToObject(recording, "last", 0);
-        cJSON_AddNumberToObject(recording, "archived", 0);
-        cJSON_AddNumberToObject(recording, "fps", fps);
-    } else {
-        frames = cJSON_GetObjectItem(recording, "images")->valueint;
-        totalJPEGSize = cJSON_GetObjectItem(recording, "size")->valueint;
-    }
-
-    // Open or create AVI file
-    char filepath[PATH_MAX_LEN];
-    sprintf(filepath, "/var/spool/storage/SD_DISK/timelapse2/%s/timelapse.avi", profileId);
-    FILE* aviFile = fopen(filepath, "rb+");
-    if (!aviFile) {
-        aviFile = fopen(filepath, "wb+");
-		write_avi_header(aviFile, 1, jpegSize, width, height, fps);
-	}
-
-    // Open or create index file
-    sprintf(filepath, "/var/spool/storage/SD_DISK/timelapse2/%s/timelapse.idx", profileId);
-    FILE* indexFile = fopen(filepath, "rb+");
-    if (!indexFile) {
-        indexFile = fopen(filepath, "wb+");
-        if (indexFile) {
-            avi_initialize_index(indexFile);
-        }
-    }
-
-    if (!aviFile || !indexFile) {
-        if (aviFile) fclose(aviFile);
-        if (indexFile) fclose(indexFile);
-        g_object_unref(buffer);
-		//pthread_mutex_unlock(&recordings_mutex);		
-        return -1;
-    }
-
-    size_t frameSize = write_avi_frame(aviFile, jpegData, jpegSize);
-	totalJPEGSize += frameSize;
-	frames++;
-    avi_add_index_entry(indexFile, frames, frameSize);
-	write_avi_header(aviFile, frames, totalJPEGSize, width, height, fps);
-
-	cJSON_SetNumberValue(cJSON_GetObjectItem(recording, "last"), timestamp);
-	cJSON_SetNumberValue(cJSON_GetObjectItem(recording, "images"), frames);
-	cJSON_SetNumberValue(cJSON_GetObjectItem(recording, "size"), totalJPEGSize);
-
-    // Cleanup
-    fclose(aviFile);
-    fclose(indexFile);
-    g_object_unref(buffer);
-
-    // Update recordings metadata
-    save_recordings();
-
-	// Check if file exceeds size limit
-	int archiveSize = 500;  // Default 500 MB
-	cJSON* settings = ACAP_Get_Config("settings");
-	if (settings && cJSON_GetObjectItem(settings, "archiveSize")) {
-		archiveSize = cJSON_GetObjectItem(settings, "archiveSize")->valueint;
-	} else {
-		LOG_WARN("%s: Invalid settings archiveSize configuration\n", __func__);
-	}
-	archiveSize *= (1024 * 1024);  // Convert MB to bytes
-	LOG_TRACE("%s: Check auto archive %d > %d \n", __func__, totalJPEGSize, archiveSize);
-	if (totalJPEGSize >= archiveSize)
-		Recordings_Archive(profileId);
-	//pthread_mutex_unlock(&recordings_mutex);
-    return 0;
+    int result = recording_store_capture_profile(profile);
+    Recordings_Container = recording_store_list();
+    return result ? 0 : -1;
 }
 
 int Recordings_Archive(const char *profileID) {
-    char profilePath[PATH_MAX_LEN];
     char archivePath[PATH_MAX_LEN];
-    char aviFile[PATH_MAX_LEN];
-    char idxFile[PATH_MAX_LEN];
     char archiveFilename[PATH_MAX_LEN];
+    char archiveFullPath[PATH_MAX_LEN];
+    char error[256];
 
-	//pthread_mutex_lock(&recordings_mutex);
-    // Check if archiving is already in progress
-    
+    long long started_ms = monotonic_ms();
+
     // Validate input
     if (!profileID) {
         LOG_WARN("Invalid profile ID\n");
-		//pthread_mutex_unlock(&recordings_mutex);		
         return -1;
     }
 
 	LOG_TRACE("%s: Entry %s",__func__,profileID);
+    if (!storage_archive_dir(archivePath, sizeof(archivePath)) ||
+        !storage_ensure_directory(archivePath, error, sizeof(error))) {
+        LOG_WARN("%s: Failed to prepare archive directory: %s\n", __func__, error);
+        return -1;
+    }
 
-    
-    // Setup paths
-    snprintf(profilePath, sizeof(profilePath), 
-             "/var/spool/storage/SD_DISK/timelapse2/%s", profileID);
-    snprintf(archivePath, sizeof(archivePath), 
-             "/var/spool/storage/SD_DISK/timelapse2/archive");
-    snprintf(aviFile, sizeof(aviFile), "%s/timelapse.avi", profilePath);
-    snprintf(idxFile, sizeof(idxFile), "%s/timelapse.idx", profilePath);
-    
-    // Create archive directory
-    ensure_directory(archivePath);
-    
     // Get metadata before clearing anything
     cJSON *recordingMetadata = Recordings_Get_Metadata(profileID);
     if (!recordingMetadata) {
         LOG_WARN("No metadata found for profile: %s\n", profileID);
-		//pthread_mutex_unlock(&recordings_mutex);	
+		//pthread_mutex_unlock(&recordings_mutex);
         return -1;
     }
-    
+
     // Get profile information
     cJSON *profile = Timelapse_Find_Profile_By_Id(profileID);
     if (!profile) {
         LOG_WARN("Profile not found for ID: %s\n", profileID);
-		//pthread_mutex_unlock(&recordings_mutex);		
+		//pthread_mutex_unlock(&recordings_mutex);
         return -1;
     }
-    
+
     // Create archive filename
     cJSON *nameItem = cJSON_GetObjectItem(profile, "name");
     if (!nameItem || !nameItem->valuestring) {
@@ -786,124 +809,85 @@ int Recordings_Archive(const char *profileID) {
     strncpy(sanitizedProfileName, profileName, PATH_MAX_LEN - 1);
     sanitizedProfileName[PATH_MAX_LEN - 1] = '\0';
     replace_spaces_with_underscores(sanitizedProfileName);
-    
+
     time_t now = time(NULL);
     struct tm *timeinfo = localtime(&now);
-    snprintf(archiveFilename, sizeof(archiveFilename), 
-             "%s/%s_%04d_%02d_%02d_%02d%02d.avi",
-             archivePath, sanitizedProfileName,
+    snprintf(archiveFilename, sizeof(archiveFilename),
+             "%s_%04d_%02d_%02d_%02d%02d.mp4",
+             sanitizedProfileName,
              timeinfo->tm_year + 1900, timeinfo->tm_mon + 1,
              timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min);
-    
-    // Create archive file (wb+ so we can seek back to patch the RIFF size)
-    FILE *archiveFile = fopen(archiveFilename, "wb+");
-    if (!archiveFile) {
-        LOG_WARN("Failed to create archive file: %s\n", archiveFilename);
-		//pthread_mutex_unlock(&recordings_mutex);		
+
+    if (!storage_join(archiveFullPath, sizeof(archiveFullPath), archivePath, archiveFilename)) {
+        LOG_WARN("%s: Archive filename is too long\n", __func__);
         return -1;
     }
-    
-    // Copy AVI file to archive
-    FILE *src = fopen(aviFile, "rb");
-    if (!src) {
-        fclose(archiveFile);
-        unlink(archiveFilename);
-        LOG_WARN("Failed to open source AVI file: %s\n", aviFile);
-		//pthread_mutex_unlock(&recordings_mutex);
+
+    cJSON *fpsItem = cJSON_GetObjectItem(recordingMetadata, "fps");
+    int fps = fpsItem ? fpsItem->valueint : 10;
+    LOG("%s: profile=%s fps=%d output=%s\n", __func__, profileID, fps, archiveFullPath);
+    if (!media_generate_archive(profileID, fps, archiveFullPath)) {
+        LOG_WARN("%s: Failed to create archive MP4 profile=%s fps=%d output=%s err=%s\n",
+                 __func__, profileID, fps, archiveFullPath, media_last_error());
+        unlink(archiveFullPath);
         return -1;
     }
-    
-    // Copy AVI content
-    char buffer[65536];
-    size_t bytesRead;
-    while ((bytesRead = fread(buffer, 1, sizeof(buffer), src)) > 0) {
-        if (fwrite(buffer, 1, bytesRead, archiveFile) != bytesRead) {
-            fclose(src);
-            fclose(archiveFile);
-            unlink(archiveFilename);
-            LOG_WARN("Failed to write to archive file\n");
-			//pthread_mutex_unlock(&recordings_mutex);			
-            return -1;
-        }
-    }
-    fclose(src);
-    long aviSize = ftell(archiveFile);
 
-    // Append index file
-    FILE *idxSrc = fopen(idxFile, "rb");
-    if (!idxSrc) {
-        fclose(archiveFile);
-        unlink(archiveFilename);
-        LOG_WARN("Failed to open index file: %s\n", idxFile);
-		//pthread_mutex_unlock(&recordings_mutex);
-		return -1;
+    struct stat archiveStat;
+    if (stat(archiveFullPath, &archiveStat) == -1) {
+        LOG_WARN("%s: Failed to stat archive MP4 %s\n", __func__, archiveFullPath);
+        unlink(archiveFullPath);
+        return -1;
     }
 
-    while ((bytesRead = fread(buffer, 1, sizeof(buffer), idxSrc)) > 0) {
-        if (fwrite(buffer, 1, bytesRead, archiveFile) != bytesRead) {
-            fclose(idxSrc);
-            fclose(archiveFile);
-            unlink(archiveFilename);
-            LOG_WARN("Failed to append index to archive\n");
-			//pthread_mutex_unlock(&recordings_mutex);
-            return -1;
-        }
-    }
-    fclose(idxSrc);
-
-    // Patch RIFF size at offset 4 to cover the appended index
-    long totalSize = ftell(archiveFile);
-    DWORD newRiffSize = LILEND4((DWORD)(totalSize - 8));
-    fseek(archiveFile, 4, SEEK_SET);
-    fwrite(&newRiffSize, sizeof(DWORD), 1, archiveFile);
-    fclose(archiveFile);
-    
     // Update archive list
     if (!ArchiveList) {
         load_archive_list();
     }
-    
+
     // Validate metadata fields before creating archive entry
-    cJSON *sizeItem   = cJSON_GetObjectItem(recordingMetadata, "size");
+    cJSON *sizeItem   = cJSON_GetObjectItem(recordingMetadata, "sizeBytes") ? cJSON_GetObjectItem(recordingMetadata, "sizeBytes") : cJSON_GetObjectItem(recordingMetadata, "size");
     cJSON *imagesItem = cJSON_GetObjectItem(recordingMetadata, "images");
-    cJSON *fpsItem    = cJSON_GetObjectItem(recordingMetadata, "fps");
     cJSON *firstItem  = cJSON_GetObjectItem(recordingMetadata, "first");
     cJSON *lastItem   = cJSON_GetObjectItem(recordingMetadata, "last");
     if (!sizeItem || !imagesItem || !fpsItem || !firstItem || !lastItem) {
         LOG_WARN("%s: Incomplete metadata for profile %s, removing archive\n", __func__, profileID);
-        unlink(archiveFilename);
+        unlink(archiveFullPath);
         return -1;
     }
 
     // Create archive entry
     cJSON *recordingInfo = cJSON_CreateObject();
     cJSON_AddStringToObject(recordingInfo, "id", profileID);
-    cJSON_AddStringToObject(recordingInfo, "filename",
-                           strrchr(archiveFilename, '/') + 1);
-    cJSON_AddNumberToObject(recordingInfo, "size",   sizeItem->valuedouble);
+    cJSON_AddStringToObject(recordingInfo, "filename", archiveFilename);
+    cJSON_AddNumberToObject(recordingInfo, "size",   archiveStat.st_size);
+    cJSON_AddNumberToObject(recordingInfo, "sourceSize", sizeItem->valuedouble);
     cJSON_AddNumberToObject(recordingInfo, "frames", imagesItem->valueint);
     cJSON_AddNumberToObject(recordingInfo, "fps",    fpsItem->valueint);
     cJSON_AddNumberToObject(recordingInfo, "first",  firstItem->valuedouble);
     cJSON_AddNumberToObject(recordingInfo, "last",   lastItem->valuedouble);
-    
+    cJSON_AddStringToObject(recordingInfo, "container", "mp4");
+    cJSON_AddStringToObject(recordingInfo, "codec", "h264");
+
     // Add to archive list and save
     cJSON_AddItemToArray(ArchiveList, recordingInfo);
     save_archive_list();
-    
+
     // Update profile archived timestamp
     if (!cJSON_GetObjectItem(profile, "archived")) {
         cJSON_AddNumberToObject(profile, "archived", ACAP_DEVICE_Timestamp());
     } else {
-        cJSON_SetNumberValue(cJSON_GetObjectItem(profile, "archived"), 
+        cJSON_SetNumberValue(cJSON_GetObjectItem(profile, "archived"),
                             ACAP_DEVICE_Timestamp());
     }
-    save_recordings();
-    
+    Timelapse_Save_Profiles();
+
     // Clear original recording
     Recordings_Clear(profileID);
-    
-    LOG_TRACE("Successfully archived recording for Profile ID: %s\n", profileID);
-	//pthread_mutex_unlock(&recordings_mutex);	
+
+    LOG("%s: success profile=%s file=%s size=%lld elapsed_ms=%lld\n",
+        __func__, profileID, archiveFilename, (long long)archiveStat.st_size, monotonic_ms() - started_ms);
+	//pthread_mutex_unlock(&recordings_mutex);
     return 0;
 }
 
@@ -911,7 +895,7 @@ int Recordings_Delete_Archive(const char* filename) {
 	//pthread_mutex_lock(&recordings_mutex);
     if (!filename) {
         LOG_WARN("%s: Missing filename\n", __func__);
-		//pthread_mutex_unlock(&recordings_mutex);		
+		//pthread_mutex_unlock(&recordings_mutex);
         return 0;
     }
 
@@ -929,10 +913,11 @@ int Recordings_Delete_Archive(const char* filename) {
         if (strcmp(id, filename) == 0) {
             found = 1;
             char filepath[PATH_MAX_LEN];
-            snprintf(filepath, sizeof(filepath), 
-                    "/var/spool/storage/SD_DISK/timelapse2/archive/%s", filename);
-
-            unlink(filepath);
+            char archive_dir[PATH_MAX_LEN];
+            if (storage_archive_dir(archive_dir, sizeof(archive_dir)) &&
+                storage_join(filepath, sizeof(filepath), archive_dir, filename)) {
+                unlink(filepath);
+            }
         } else {
             cJSON_AddItemToArray(newArchiveList, cJSON_Duplicate(item, 1));
         }
@@ -955,12 +940,61 @@ int Recordings_Delete_Archive(const char* filename) {
     return found;
 }
 
+int Recordings_Delete_Profile_Media(const char* profileId) {
+    if (!profileId) {
+        return 0;
+    }
+
+    if (!ArchiveList) {
+        load_archive_list();
+    }
+
+    int removed_archives = 0;
+    cJSON* newArchiveList = cJSON_CreateArray();
+    if (!newArchiveList) {
+        return 0;
+    }
+
+    cJSON* item = ArchiveList ? ArchiveList->child : NULL;
+    while (item) {
+        const char* source_id = cJSON_GetStringValue(cJSON_GetObjectItem(item, "id"));
+        const char* filename = cJSON_GetStringValue(cJSON_GetObjectItem(item, "filename"));
+        if (source_id && strcmp(source_id, profileId) == 0) {
+            if (filename) {
+                char filepath[PATH_MAX_LEN];
+                char archive_dir[PATH_MAX_LEN];
+                if (storage_archive_dir(archive_dir, sizeof(archive_dir)) &&
+                    storage_join(filepath, sizeof(filepath), archive_dir, filename)) {
+                    unlink(filepath);
+                }
+            }
+            removed_archives++;
+        } else {
+            cJSON_AddItemToArray(newArchiveList, cJSON_Duplicate(item, 1));
+        }
+        item = item->next;
+    }
+
+    if (removed_archives > 0) {
+        cJSON_Delete(ArchiveList);
+        ArchiveList = newArchiveList;
+        save_archive_list();
+    } else {
+        cJSON_Delete(newArchiveList);
+    }
+
+    int clear_ok = Recordings_Clear(profileId) == 0;
+    LOG("%s: profile=%s clear=%s removed_archives=%d\n",
+        __func__, profileId, clear_ok ? "ok" : "failed", removed_archives);
+    return clear_ok;
+}
+
 static void
-HTTP_Endpoint_Image(const ACAP_HTTP_Response response, 
+HTTP_Endpoint_Image(const ACAP_HTTP_Response response,
                               const ACAP_HTTP_Request request) {
     const char* method = ACAP_HTTP_Get_Method(request);
     LOG_TRACE("%s: %s\n", __func__, method);
-    
+
     if (strcmp(method, "GET") != 0) {
         ACAP_HTTP_Respond_Error(response, 405, "Method not allowed");
         return;
@@ -977,76 +1011,40 @@ HTTP_Endpoint_Image(const ACAP_HTTP_Response response,
     }
 
     int index = atoi(indexStr);
-    
+
     // Read frame index
-    char idxfile[PATH_MAX_LEN];
-    sprintf(idxfile, "/var/spool/storage/SD_DISK/timelapse2/%s/timelapse.idx", profileId);
-    
-    FILE* idxf = fopen(idxfile, "rb");
-    if (!idxf) {
-        ACAP_HTTP_Respond_Error(response, 404, "Recording not found");
+    char framepath[PATH_MAX_LEN];
+    if (!storage_frame_path(framepath, sizeof(framepath), profileId, (unsigned)index)) {
+        ACAP_HTTP_Respond_Error(response, 500, "Failed to build frame path");
         return;
     }
 
-    // Read index header and entry
-    LIST_INDEX list_header;
-    AVI_INDEX_ENTRY entry;
-    
-    // Read index header
-    if (fread(&list_header, sizeof(LIST_INDEX), 1, idxf) != 1) {
-        fclose(idxf);
-        ACAP_HTTP_Respond_Error(response, 404, "Invalid index file");
-        return;
-    }
-    
-    // Seek to frame entry
-    fseek(idxf, sizeof(LIST_INDEX) + ((index-1) * sizeof(AVI_INDEX_ENTRY)), SEEK_SET);
-    if (fread(&entry, sizeof(AVI_INDEX_ENTRY), 1, idxf) != 1) {
-        fclose(idxf);
+    FILE* framefile = fopen(framepath, "rb");
+    if (!framefile) {
         ACAP_HTTP_Respond_Error(response, 404, "Frame not found");
         return;
     }
-    fclose(idxf);
 
-    LOG_TRACE("%s: Index Entry: offset=%u, size=%u\n", __func__, 
-              LILEND4(entry.offset), LILEND4(entry.size));
+    fseek(framefile, 0, SEEK_END);
+    long frame_size = ftell(framefile);
+    fseek(framefile, 0, SEEK_SET);
 
-    // Read frame from AVI
-    char avifile[PATH_MAX_LEN];
-    sprintf(avifile, "/var/spool/storage/SD_DISK/timelapse2/%s/timelapse.avi", profileId);
-    
-    FILE* avif = fopen(avifile, "rb");
-    if (!avif) {
-        ACAP_HTTP_Respond_Error(response, 404, "Recording file not found");
-        return;
-    }
-
-    // Calculate correct offset: AVI header + movi list header + frame offset
-	long frame_offset = sizeof(AVI_HEADER) + LILEND4(entry.offset) - 4;
-	LOG_TRACE("%s: File offset = %ld\n",__func__,frame_offset);
-	fseek(avif, frame_offset, SEEK_SET);
-
-	// Skip chunk header (8 bytes: '00db' + size)
-	fseek(avif, sizeof(LIST_INDEX), SEEK_CUR);
-
-	// Allocate buffer for actual JPEG data
-	unsigned int frame_size = LILEND4(entry.size);
 	char* buffer = malloc(frame_size);
 	if (!buffer) {
-		fclose(avif);
+		fclose(framefile);
 		ACAP_HTTP_Respond_Error(response, 500, "Memory allocation failed");
 		return;
 	}
 
-	fread(buffer, 1, frame_size, avif);
-    fclose(avif);
+	fread(buffer, 1, frame_size, framefile);
+    fclose(framefile);
 
     ACAP_HTTP_Respond_String(response, "status: 200 OK\r\n");
     ACAP_HTTP_Respond_String(response, "Content-Type: image/jpeg\r\n");
-    ACAP_HTTP_Respond_String(response, "Content-Length: %u\r\n", frame_size);
+    ACAP_HTTP_Respond_String(response, "Content-Length: %ld\r\n", frame_size);
     ACAP_HTTP_Respond_String(response, "\r\n");
 
-    int result = ACAP_HTTP_Respond_Data(response, frame_size, buffer);
+    int result = ACAP_HTTP_Respond_Data(response, (size_t)frame_size, buffer);
     if (result != 1) {
         LOG_WARN("%s: Failed to send image data\n", __func__);
     }
@@ -1054,9 +1052,10 @@ HTTP_Endpoint_Image(const ACAP_HTTP_Response response,
     free(buffer);
 }
 
-static void HTTP_Endpoint_Export(const ACAP_HTTP_Response response, 
+static void HTTP_Endpoint_Export(const ACAP_HTTP_Response response,
                                const ACAP_HTTP_Request request) {
     const char* method = ACAP_HTTP_Get_Method(request);
+	long long started_ms = monotonic_ms();
 	LOG_TRACE("%s: %s\n", __func__,method);
     if (strcmp(method, "GET") != 0) {
         ACAP_HTTP_Respond_Error(response, 405, "Method not allowed");
@@ -1064,105 +1063,100 @@ static void HTTP_Endpoint_Export(const ACAP_HTTP_Response response,
     }
 
     const char* profileId = ACAP_HTTP_Request_Param(request, "id");
-    const char* fpsString = ACAP_HTTP_Request_Param(request, "fps");
-    const char* filename = ACAP_HTTP_Request_Param(request, "filename");
-
-
-    
-    if (!profileId || !fpsString || !filename) {
+    if (!profileId) {
         ACAP_HTTP_Respond_Error(response, 400, "Missing parameters");
         return;
     }
-	LOG_TRACE("%s: %s %s %s\n", __func__, profileId, filename, fpsString );
 
-	int fps = atoi(fpsString);
+    cJSON* profile = Timelapse_Find_Profile_By_Id(profileId);
+    int fps = 10;
+    const char* profile_name = profileId;
+    if (profile) {
+        cJSON* fps_item = cJSON_GetObjectItem(profile, "fps");
+        cJSON* name_item = cJSON_GetObjectItem(profile, "name");
+        if (fps_item && fps_item->type == cJSON_Number) {
+            fps = fps_item->valueint;
+        }
+        if (name_item && name_item->valuestring && name_item->valuestring[0]) {
+            profile_name = name_item->valuestring;
+        }
+    }
+
 	if( fps < 1 ) fps = 1;
 	if (fps > 60) fps = 60;
+	LOG_TRACE("%s: %s fps=%d\n", __func__, profileId, fps );
 
-    char avipath[PATH_MAX_LEN], idxpath[PATH_MAX_LEN];
-    snprintf(avipath, sizeof(avipath), 
-             "/var/spool/storage/SD_DISK/timelapse2/%s/timelapse.avi", profileId);
-    snprintf(idxpath, sizeof(idxpath), 
-             "/var/spool/storage/SD_DISK/timelapse2/%s/timelapse.idx", profileId);
-
-	FILE* aviFile = fopen(avipath, "rb+");
-    FILE* idxFile = fopen(idxpath, "rb");
-    
-    if (!aviFile || !idxFile) {
-        if (aviFile) fclose(aviFile);
-        if (idxFile) fclose(idxFile);
-        ACAP_HTTP_Respond_Error(response, 404, "Recording not found");
+    char output_path[PATH_MAX_LEN];
+    if (!media_process_pending(profileId, fps)) {
+        int status = media_ffmpeg_available() ? 500 : 503;
+        LOG_WARN("%s: failed profile=%s fps=%d status=%d err=%s\n", __func__, profileId, fps, status, media_last_error());
+        ACAP_HTTP_Respond_Error(response, status, media_last_error());
         return;
     }
 
-    cJSON* recording = cJSON_GetObjectItem(Recordings_Container, profileId);
-	if( recording ) {
-		if( !cJSON_GetObjectItem(recording,"fps") ) {
-			cJSON_AddNumberToObject(recording,"fps",fps );
-			update_avi_fps(aviFile, fps);
-			save_recordings();
-		}
-		if( cJSON_GetObjectItem(recording,"fps")->valueint != fps ) {
-			cJSON_SetNumberValue(cJSON_GetObjectItem(recording, "fps"), fps);
-			update_avi_fps(aviFile, fps);
-			save_recordings();
-		}
-	}
-
-    // Get file sizes
-    fseek(aviFile, 0, SEEK_END);
-    fseek(idxFile, 0, SEEK_END);
-    long aviSize = ftell(aviFile);
-    long idxSize = ftell(idxFile);
-    long totalSize = aviSize + idxSize;
-
-    // Reset file positions
-    fseek(aviFile, 0, SEEK_SET);
-    fseek(idxFile, 0, SEEK_SET);
-	LOG_TRACE("%s: Uploading %s %ld\n",__func__,filename,totalSize);
-    // Send response headers
-    ACAP_HTTP_Respond_String(response, "status: 200 OK\r\n");
-    ACAP_HTTP_Respond_String(response, "Content-Type: video/x-msvideo\r\n");
-    ACAP_HTTP_Respond_String(response, "Content-Disposition: attachment; filename=%s\r\n", filename);
-    ACAP_HTTP_Respond_String(response, "Content-Length: %ld\r\n", totalSize);
-    ACAP_HTTP_Respond_String(response, "\r\n");
-
-    // Use larger buffer for efficient transfer
-    char* buffer = malloc(65536);
-    if (!buffer) {
-        fclose(aviFile);
-        fclose(idxFile);
-        ACAP_HTTP_Respond_Error(response, 500, "Memory allocation failed");
+    if (!storage_export_path(output_path, sizeof(output_path), profileId, fps)) {
+        ACAP_HTTP_Respond_Error(response, 500, "Failed to build export path");
         return;
     }
 
-    // Send AVI file content
-    size_t bytesRead;
-    while ((bytesRead = fread(buffer, 1, 65536, aviFile)) > 0) {
-        if (ACAP_HTTP_Respond_Data(response, bytesRead, buffer) != 1) {
-            break;  // Handle transfer interruption
-        }
-    }
+    LOG("%s: generated profile=%s fps=%d path=%s elapsed_ms=%lld\n", __func__, profileId, fps, output_path, monotonic_ms() - started_ms);
 
-    // Send index file content
-    while ((bytesRead = fread(buffer, 1, 65536, idxFile)) > 0) {
-        if (ACAP_HTTP_Respond_Data(response, bytesRead, buffer) != 1) {
-            break;  // Handle transfer interruption
-        }
-    }
-
-    free(buffer);
-    fclose(aviFile);
-    fclose(idxFile);
+    char download_name[PATH_MAX_LEN];
+    snprintf(download_name, sizeof(download_name), "%s.mp4", profile_name);
+    normalize_mp4_filename(download_name, sizeof(download_name), download_name);
+    stream_file_response(response, output_path, "video/mp4", "attachment", download_name);
 }
 
-static void 
-HTTP_Endpoint_Recordings(const ACAP_HTTP_Response response, 
+static void HTTP_Endpoint_Video(const ACAP_HTTP_Response response, const ACAP_HTTP_Request request) {
+    const char* method = ACAP_HTTP_Get_Method(request);
+    long long started_ms = monotonic_ms();
+    if (strcmp(method, "GET") != 0) {
+        ACAP_HTTP_Respond_Error(response, 405, "Method not allowed");
+        return;
+    }
+
+    const char* profileId = ACAP_HTTP_Request_Param(request, "id");
+    const char* fpsString = ACAP_HTTP_Request_Param(request, "fps");
+    if (!profileId) {
+        ACAP_HTTP_Respond_Error(response, 400, "Missing profile id");
+        return;
+    }
+
+    int fps = fpsString ? atoi(fpsString) : 10;
+    if( fps < 1 ) fps = 1;
+    if (fps > 60) fps = 60;
+
+    LOG("%s: request profile=%s fps=%d\n", __func__, profileId, fps);
+
+    // Ensure newest frame chunks are folded into the master recording before playback.
+    if (!media_process_pending(profileId, fps)) {
+        int status = media_ffmpeg_available() ? 500 : 503;
+        LOG_WARN("%s: process_pending failed profile=%s fps=%d status=%d err=%s\n",
+                 __func__, profileId, fps, status, media_last_error());
+        ACAP_HTTP_Respond_Error(response, status, media_last_error());
+        return;
+    }
+
+    char output_path[PATH_MAX_LEN];
+    if (!media_generate_preview(profileId, fps, output_path, sizeof(output_path))) {
+        int status = media_ffmpeg_available() ? 500 : 503;
+        LOG_WARN("%s: failed profile=%s fps=%d status=%d err=%s\n", __func__, profileId, fps, status, media_last_error());
+        ACAP_HTTP_Respond_Error(response, status, media_last_error());
+        return;
+    }
+
+    LOG("%s: generated profile=%s fps=%d path=%s elapsed_ms=%lld\n", __func__, profileId, fps, output_path, monotonic_ms() - started_ms);
+
+    stream_file_response(response, output_path, "video/mp4", "inline", "preview.mp4");
+}
+
+static void
+HTTP_Endpoint_Recordings(const ACAP_HTTP_Response response,
                                      const ACAP_HTTP_Request request) {
     const char* method = ACAP_HTTP_Get_Method(request);
 
 	LOG_TRACE("%s: %s\n",__func__,method);
-    
+
     if (strcmp(method, "GET") == 0) {
         if (!Recordings_Container) {
             load_recordings();
@@ -1189,10 +1183,10 @@ HTTP_Endpoint_Recordings(const ACAP_HTTP_Response response,
 			return;
 		}
 
-		if (Recordings_Clear(profileId) == 0) {
-			ACAP_HTTP_Respond_Text(response, "Recording deleted");
+        if (Queue_Reset_Media(profileId)) {
+            ACAP_HTTP_Respond_Text(response, "Recording media reset started");
 		} else {
-			ACAP_HTTP_Respond_Error(response, 500, "Failed to delete recording");
+            ACAP_HTTP_Respond_Error(response, 500, "Failed to start recording media reset");
 		}
 		return;
 	}
@@ -1204,6 +1198,7 @@ HTTP_Endpoint_Recordings(const ACAP_HTTP_Response response,
 static void HTTP_Endpoint_Archive(const ACAP_HTTP_Response response,
                                   const ACAP_HTTP_Request request) {
     const char *method = ACAP_HTTP_Get_Method(request);
+	long long started_ms = monotonic_ms();
 	LOG_TRACE("%s: %s\n",__func__,method);
     // Handle GET request: Provide the archive/recordings.json
     if (strcmp(method, "GET") == 0) {
@@ -1238,12 +1233,16 @@ static void HTTP_Endpoint_Archive(const ACAP_HTTP_Response response,
             return;
         }
 
+        LOG("%s: request profile=%s\n", __func__, profileID);
+
         // Call Recordings_Archive to perform the archiving operation
         int result = Recordings_Archive(profileID);
         if (result == 0) {
             load_archive_list(); // Reload archive list after archiving
+            LOG("%s: success profile=%s elapsed_ms=%lld\n", __func__, profileID, monotonic_ms() - started_ms);
             ACAP_HTTP_Respond_Text(response, "Recording archived successfully");
         } else {
+            LOG_WARN("%s: failed profile=%s elapsed_ms=%lld\n", __func__, profileID, monotonic_ms() - started_ms);
             ACAP_HTTP_Respond_Error(response, 500, "Failed to archive recording");
         }
         return;
@@ -1265,46 +1264,17 @@ static void HTTP_Endpoint_Download(const ACAP_HTTP_Response response, const ACAP
         ACAP_HTTP_Respond_Error(response, 400, "Missing filename parameter");
         return;
     }
+    const char* inline_param = ACAP_HTTP_Request_Param(request, "inline");
 
     char filepath[PATH_MAX_LEN];
-    snprintf(filepath, sizeof(filepath), 
-             "/var/spool/storage/SD_DISK/timelapse2/archive/%s", filename);
-
-    FILE* file = fopen(filepath, "rb");
-    if (!file) {
-        ACAP_HTTP_Respond_Error(response, 404, "File not found");
+    char archive_dir[PATH_MAX_LEN];
+    if (!storage_archive_dir(archive_dir, sizeof(archive_dir)) ||
+        !storage_join(filepath, sizeof(filepath), archive_dir, filename)) {
+        ACAP_HTTP_Respond_Error(response, 500, "Failed to build archive path");
         return;
     }
 
-    // Get file size
-    fseek(file, 0, SEEK_END);
-    long fileSize = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    // Send response headers
-    ACAP_HTTP_Respond_String(response, "status: 200 OK\r\n");
-    ACAP_HTTP_Respond_String(response, "Content-Type: video/x-msvideo\r\n");
-    ACAP_HTTP_Respond_String(response, "Content-Disposition: attachment; filename=%s\r\n", filename);
-    ACAP_HTTP_Respond_String(response, "Content-Length: %ld\r\n", fileSize);
-    ACAP_HTTP_Respond_String(response, "\r\n");
-
-    // Send file content in chunks
-    char* buffer = malloc(65536);
-    if (!buffer) {
-        fclose(file);
-        ACAP_HTTP_Respond_Error(response, 500, "Memory allocation failed");
-        return;
-    }
-
-    size_t bytesRead;
-    while ((bytesRead = fread(buffer, 1, 65536, file)) > 0) {
-        if (ACAP_HTTP_Respond_Data(response, bytesRead, buffer) != 1) {
-            break;  // Handle transfer interruption
-        }
-    }
-
-    free(buffer);
-    fclose(file);
+    stream_file_response(response, filepath, "video/mp4", inline_param && strcmp(inline_param, "1") == 0 ? "inline" : "attachment", filename);
 }
 
 
@@ -1320,23 +1290,14 @@ static void HTTP_Endpoint_Test(const ACAP_HTTP_Response response, const ACAP_HTT
 
 void
 Recordings_Reset() {
-	//pthread_mutex_lock(&recordings_mutex);	
-	if( Recordings_Container )
-		cJSON_Delete(Recordings_Container);
-	Recordings_Container = cJSON_CreateObject();
-	save_recordings();
+    recording_store_reset();
+    Recordings_Container = recording_store_list();
 	if( ArchiveList )
 		cJSON_Delete( ArchiveList );
 	ArchiveList = cJSON_CreateArray();
 	save_archive_list();
 	//pthread_mutex_unlock(&recordings_mutex);
 }
-
-// Helper reused for weekly split
-static int get_week_of_year(struct tm *tm) {
-    return (tm->tm_yday - tm->tm_wday + 7) / 7;
-}
-
 
 static gboolean check_midnight(gpointer user_data) {
 
@@ -1354,61 +1315,89 @@ LOG_TRACE("Midnight check: %d:%d", hour, minute);
 		g_date_time_unref(now);
 		return TRUE; // Keep the timeout running
 	}
-	LOG_TRACE("Midnight");	
+	LOG_TRACE("Midnight");
     if (did_trigger_today) {
 		g_date_time_unref(now);
 		return TRUE; // Keep the timeout running
 	}
 
 	did_trigger_today = true;
-	
-	cJSON* settings = ACAP_Get_Config("settings");
-	
-	bool  doArchive = false;
-	char* archiveSplit = cJSON_GetObjectItem(settings, "archiveSplit")?cJSON_GetObjectItem(settings, "archiveSplit")->valuestring:"era";
-	if( strcmp(archiveSplit,"daily") == 0 ) doArchive = true;
-    int day_of_week = g_date_time_get_day_of_week(now);   // Monday == 1
-    int day_of_month = g_date_time_get_day_of_month(now);
 
-    if (day_of_week == 1 && strcmp(archiveSplit,"weekly") == 0 )
-		doArchive = true;
-	if (day_of_month == 1 && strcmp(archiveSplit,"monthly") == 0)
-		doArchive = true;
-
-	if( doArchive ) {
-		LOG_TRACE("Archiving...");
-		cJSON* list = cJSON_CreateArray();
-        cJSON *profile = Recordings_Container->child;
-        while(profile) {
-			cJSON_AddItemToArray(list,cJSON_CreateString(profile->string));
-			profile = profile->next;
-		}
-		profile = list->child;
-		while(profile ) {
-			LOG_TRACE("Archiving: %s",profile->valuestring);
-            Recordings_Archive(profile->valuestring);
-			profile = profile->next;
-		}
-	}
+    LOG_TRACE("Archive duration check");
+    cJSON* list = cJSON_CreateArray();
+    cJSON *recording = Recordings_Container ? Recordings_Container->child : NULL;
+    while(recording) {
+        if (recording_due_for_archive(recording->string, recording, now)) {
+            cJSON_AddItemToArray(list,cJSON_CreateString(recording->string));
+        }
+        recording = recording->next;
+    }
+    cJSON* profile = list ? list->child : NULL;
+    while(profile) {
+        LOG_TRACE("Archiving: %s", profile->valuestring);
+        Recordings_Archive(profile->valuestring);
+        profile = profile->next;
+    }
+    cJSON_Delete(list);
 	Retention_Cleanup();
     g_date_time_unref(now);
 	LOG_TRACE("%s: Exit",__func__);
     return TRUE; // Keep the timeout running
 }
 
+static gboolean process_chunks_hourly(gpointer user_data) {
+    cJSON *recording = Recordings_Container ? Recordings_Container->child : NULL;
+    int processed = 0;
+    int skipped = 0;
+
+    while (recording) {
+        const char* profile_id = recording->string;
+        cJSON* images = cJSON_GetObjectItem(recording, "images");
+        int image_count = images ? images->valueint : 0;
+        if (!profile_id || image_count < 1) {
+            skipped++;
+            recording = recording->next;
+            continue;
+        }
+
+        cJSON* profile = Timelapse_Find_Profile_By_Id(profile_id);
+        int fps = 10;
+        if (profile) {
+            cJSON* fps_item = cJSON_GetObjectItem(profile, "fps");
+            if (fps_item && fps_item->type == cJSON_Number) {
+                fps = fps_item->valueint;
+            }
+        }
+
+        if (!media_process_pending(profile_id, fps)) {
+            LOG_WARN("%s: skip profile=%s fps=%d err=%s\n", __func__, profile_id, fps, media_last_error());
+            skipped++;
+        } else {
+            processed++;
+        }
+
+        recording = recording->next;
+    }
+
+    LOG("%s: done processed=%d skipped=%d\n", __func__, processed, skipped);
+    return TRUE;
+}
+
 
 int
 Recordings_Init(void) {
     LOG_TRACE("%s:\n", __func__);
-    Recordings_Container = load_recordings();
+	recording_store_init();
+    Recordings_Container = recording_store_list();
 	load_archive_list();
-	
+
     // Schedule retention check at midnight
 	g_timeout_add_seconds(60, check_midnight, NULL);
+    g_timeout_add_seconds(3600, process_chunks_hourly, NULL);
 
-	
+
     ACAP_HTTP_Node("recordings", HTTP_Endpoint_Recordings);
-    ACAP_HTTP_Node("image", HTTP_Endpoint_Image);
+    ACAP_HTTP_Node("video", HTTP_Endpoint_Video);
     ACAP_HTTP_Node("export", HTTP_Endpoint_Export);
     ACAP_HTTP_Node("archive", HTTP_Endpoint_Archive);
     ACAP_HTTP_Node("download", HTTP_Endpoint_Download);

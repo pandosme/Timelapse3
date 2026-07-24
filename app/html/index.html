@@ -4,137 +4,590 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Timelapse</title>
-    <link rel="stylesheet" href="css/bootstrap.min.css">
-    <link rel="stylesheet" href="css/app.css">
-    <script src="js/jquery-3.7.1.min.js"></script>
-    <script src="js/bootstrap.bundle.min.js"></script>
-    <style>
-        #init-message {
-            z-index: 1055;
-            position: fixed;
-            top: 60px;
-            left: 50%;
-            transform: translateX(-50%);
-            width: auto;
-            min-width: 250px;
-            padding: 1rem 2rem;
-            background: #fffbcc;
-            color: #333;
-            border: 1px solid #ffe58f;
-            border-radius: 6px;
-            box-shadow: 0 2px 10px 0 rgba(0,0,0,0.06);
-            text-align: center;
-            font-weight: 500;
-            display: none;
-        }
-    </style>
+    <link rel="stylesheet" href="css/bootstrap.min.css?v=3.0.0">
+    <link rel="stylesheet" href="css/tom-select.bootstrap5.min.css?v=3.0.0">
+    <link rel="stylesheet" href="css/app.css?v=3.0.0">
+    <script src="js/jquery-3.7.1.min.js?v=3.0.0"></script>
+    <script src="js/bootstrap.bundle.min.js?v=3.0.0"></script>
+    <script src="js/tom-select.complete.min.js?v=3.0.0"></script>
+    <script src="js/events.js?v=3.0.0"></script>
 </head>
 <body>
 <div id="init-message"></div>
-<div class="d-flex" id="wrapper">
-    <div class="bg-light border-right" id="sidebar-wrapper">
-        <div class="sidebar-heading"></div>
-        <div class="list-group list-group-flush">
-            <a href="index.html" class="list-group-item list-group-item-action active">Recordings</a>
-            <a href="timelapse.html" class="list-group-item list-group-item-action">Settings</a>
-            <a href="sunevents.html" class="list-group-item list-group-item-action">Location</a>
-            <a href="archive.html" class="list-group-item list-group-item-action">Archive</a>
-            <a href="about.html" class="list-group-item list-group-item-action">About</a>
-        </div>
-    </div>
-    
-    <div id="page-content-wrapper" class="p-0">
-        <div class="container-fluid">
-            <div class="table-responsive mt-4">
-                <table class="table table-striped">
-                    <thead>
-                        <tr>
-                            <th>Profile Name</th>
-                            <th>Images</th>
-                            <th>Size</th>
-                            <th>Last Capture</th>
-                            <th>First Capture</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="recordings-list"></tbody>
-                </table>
-            </div>
-        </div>
-    </div>
+<div class="tl-app">
+    <aside class="tl-sidebar">
+        <div class="tl-brand"><span class="tl-brand-text">Timelapse</span></div>
+        <nav class="tl-nav" aria-label="Primary navigation">
+            <a href="index.html" class="tl-nav-link active">Recordings</a>
+            <a href="sunevents.html" class="tl-nav-link">Settings</a>
+            <a href="about.html" class="tl-nav-link">About</a>
+        </nav>
+    </aside>
 
-    <div class="modal fade" id="inspectModal" tabindex="-1" aria-labelledby="inspectModalLabel" aria-hidden="true">
-        <div class="modal-dialog modal-lg">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="inspectModalLabel">Inspect Images</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+    <main class="tl-main">
+        <div class="container-fluid">
+            <header class="tl-topbar">
+                <div>
+                    <h1 class="tl-page-title">Recordings</h1>
                 </div>
-                <div class="modal-body">
-                    <img id="inspectImage" class="img-fluid mb-3" alt="Inspection Image">
-                    <div class="d-flex justify-content-between align-items-center">
-                        <button id="prevButton" class="btn btn-outline-primary">&lt;</button>
-                        <input type="range" class="form-range mx-2" id="imageSlider" min="1" max="1" value="1">
-                        <button id="nextButton" class="btn btn-outline-primary">&gt;</button>
+                <div class="tl-toolbar">
+                    <button type="button" class="btn btn-primary" id="addProfileBtn">Add recording</button>
+                    <button type="button" class="btn btn-outline-primary" id="refreshBtn">Refresh</button>
+                </div>
+            </header>
+
+            <section class="tl-panel">
+                <div class="tl-panel-header">
+                    <div>
+                        <h2 class="tl-panel-title">Recording library</h2>
                     </div>
                 </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <div class="table-responsive">
+                    <table class="table tl-table">
+                        <thead>
+                            <tr>
+                                <th>Type</th>
+                                <th>Profile</th>
+                                <th>Frames</th>
+                                <th>Size</th>
+                                <th>Last capture</th>
+                                <th>Days</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recordings-list">
+                            <tr><td colspan="7" class="tl-empty"><strong>Loading recordings</strong>Please wait while the camera reports active and archived media.</td></tr>
+                        </tbody>
+                    </table>
                 </div>
-            </div>
+            </section>
         </div>
-    </div>
-    <div class="modal fade" id="exportModal" tabindex="-1" aria-labelledby="exportModalLabel" aria-hidden="true">
-        <div class="modal-dialog">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="exportModalLabel">Export Recording</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-                </div>
-                <div class="modal-body">
-                    <form id="exportForm">
-                        <div class="mb-3">
-                            <label for="exportFilename" class="form-label">Filename</label>
-                            <input type="text" class="form-control" id="exportFilename" required>
-                        </div>
-                        <div class="mb-3">
-                            <label for="exportFps" class="form-label">Playback Frame Rate</label>
-                            <input type="number" class="form-control" id="exportFps" value="10" min="1" max="60" required>
-                        </div>
-                        <input type="hidden" id="exportProfileId">
-                    </form>
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                    <button type="button" class="btn btn-primary" id="exportDownloadBtn">Download</button>
-                </div>
-            </div>
-        </div>
-    </div>
-    <div class="modal fade" id="errorModal" tabindex="-1" aria-labelledby="errorModalLabel" aria-hidden="true">
-        <div class="modal-dialog">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="errorModalLabel">Error</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-                </div>
-                <div class="modal-body">
-                    The application is not running.
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                </div>
-            </div>
-        </div>
-    </div>                
+    </main>
 </div>
 
-<script>
+<div class="modal fade" id="playModal" tabindex="-1" aria-labelledby="playModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="playModalLabel">Play recording</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="tl-video-frame">
+                    <video id="playVideo" controls preload="metadata"></video>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 
-var TimelapseRecordings = 0;
+<div class="modal fade" id="timelapseModal" tabindex="-1" aria-labelledby="timelapseModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div>
+                    <h5 class="modal-title" id="timelapseModalLabel">Add recording</h5>
+                </div>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <form id="timelapse-form">
+                    <div class="row g-3">
+                        <div class="col-12">
+                            <label class="form-label fw-bold" for="name">Name</label>
+                            <input type="text" class="form-control form-control-lg" id="name" required>
+                        </div>
+
+                        <div class="col-12">
+                            <label class="form-label fw-bold">Capture trigger</label>
+                            <div class="btn-group w-100" role="group" aria-label="Capture trigger type">
+                                <input type="radio" class="btn-check" name="triggerType" id="triggerType-event" checked>
+                                <label class="btn btn-outline-primary" for="triggerType-event">Event based</label>
+                                <input type="radio" class="btn-check" name="triggerType" id="triggerType-timer">
+                                <label class="btn btn-outline-primary" for="triggerType-timer">Timer based</label>
+                            </div>
+                        </div>
+
+                        <div class="col-12" id="event-section">
+                            <label class="form-label fw-bold" for="trigger-event">Event trigger</label>
+                            <select id="trigger-event" placeholder="Select an event..."></select>
+                        </div>
+
+                        <div class="col-12 d-none" id="timer-section">
+                            <label class="form-label fw-bold" for="timer-value">Timer interval</label>
+                            <div class="input-group input-group-lg">
+                                <input type="number" class="form-control" id="timer-value" min="1">
+                                <select class="form-select" id="timer-unit" aria-label="Timer unit">
+                                    <option value="1">Seconds</option>
+                                    <option value="60">Minutes</option>
+                                    <option value="3600">Hours</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold" for="resolution">Resolution</label>
+                            <select class="form-select form-select-lg" id="resolution" required></select>
+                        </div>
+
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold" for="fps">Playback FPS</label>
+                            <input type="number" id="fps" class="form-control form-control-lg" min="1" max="60" step="1" value="10" required>
+                        </div>
+
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold" for="overlay">Text overlay</label>
+                            <select class="form-select form-select-lg" id="overlay">
+                                <option value="true">Include</option>
+                                <option value="false">Exclude</option>
+                            </select>
+                        </div>
+
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold" for="conditions">Sun conditions</label>
+                            <select class="form-select form-select-lg" id="conditions">
+                                <option value="any">Anytime</option>
+                                <option value="dawn-dusk">Only between dawn and dusk</option>
+                                <option value="sunrise-sunset">Only between sunrise and sunset</option>
+                            </select>
+                        </div>
+
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold" for="archive-schedule">Archive cadence</label>
+                            <select class="form-select form-select-lg" id="archive-schedule" required>
+                                <option value="none">No Archive</option>
+                                <option value="daily">Daily</option>
+                                <option value="weekly">Weekly</option>
+                                <option value="monthly" selected>Monthly</option>
+                            </select>
+                        </div>
+
+                        <div class="col-md-6">
+                            <label class="form-label fw-bold" for="expected-images-per-day">Expected images per day</label>
+                            <input type="number" class="form-control form-control-lg" id="expected-images-per-day" min="1" value="1" required>
+                        </div>
+
+                        <div class="col-12">
+                            <span class="tl-badge warm" id="archive-guide">31 expected images per archive.</span>
+                        </div>
+                    </div>
+
+                    <input type="hidden" id="edit-id">
+                    <input type="hidden" id="archived" value="0">
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-primary" data-bs-dismiss="modal">Cancel</button>
+                <button type="submit" form="timelapse-form" id="saveProfileBtn" class="btn btn-primary d-none">Save recording</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="errorModal" tabindex="-1" aria-labelledby="errorModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="errorModalLabel">Application unavailable</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">The Timelapse service did not respond.</div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="busyModal" tabindex="-1" aria-labelledby="busyModalLabel" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="busyModalLabel">Processing</h5>
+            </div>
+            <div class="modal-body">
+                <div id="busyModalText">Please wait...</div>
+                <div class="progress mt-3" role="progressbar" aria-label="Processing progress" aria-valuemin="0" aria-valuemax="100">
+                    <div id="busyModalProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width: 0%">0%</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="migrationModal" tabindex="-1" aria-labelledby="migrationModalLabel" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="migrationModalLabel">AVI migration required</h5>
+            </div>
+            <div class="modal-body">
+                <p id="migrationMessage" class="mb-3">Timelapse found AVI recordings from an earlier version. They must be converted to MP4 before this version can continue.</p>
+                <p class="text-muted small mb-3">Cancel keeps AVI files unchanged and leaves this version stopped so 2.x.x can be reinstalled manually.</p>
+                <div class="tl-migration-current" id="migrationCurrent">Waiting for your decision.</div>
+                <div class="tl-progress-block" id="migrationCurrentFileProgress">
+                    <div class="tl-progress-label"><span>Current file</span><span id="migrationFileProgressText">0%</span></div>
+                    <div class="progress" role="progressbar" aria-label="Current file progress" aria-valuemin="0" aria-valuemax="100">
+                        <div id="migrationFileProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width: 0%">0%</div>
+                    </div>
+                </div>
+                <div class="tl-progress-block">
+                    <div class="tl-progress-label"><span>Overall</span><span id="migrationOverallProgressText">0%</span></div>
+                    <div class="progress" role="progressbar" aria-label="Overall migration progress" aria-valuemin="0" aria-valuemax="100">
+                    <div id="migrationProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width: 0%">0%</div>
+                    </div>
+                </div>
+                <div class="tl-migration-count mt-2" id="migrationCount">0 of 0 files</div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" id="rollbackMigrationBtn">Cancel and keep AVI</button>
+                <button type="button" class="btn btn-primary" id="startMigrationBtn">Convert to MP4</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="feedbackToast" class="tl-toast" aria-live="polite" aria-atomic="true"></div>
+
+<script>
+let timelapseRecordings = {};
+let timelapseArchives = [];
+let timelapseProfiles = [];
+let availableEvents = [];
+let eventSelect = null;
+let mediaJobUiTimer = null;
+let mediaJobStatusTimer = null;
+let mediaJobRequestInFlight = false;
+let mediaJobClientStartMs = 0;
+let mediaJobStage = 'Saving recording...';
+let mediaJobEstimateSec = 0;
+let mediaJobProgress = 0;
+let mediaJobKind = '';
+let mediaJobCompleteToast = 'Recording updated and media processing completed.';
+let mediaJobFallbackToast = 'Recording updated.';
+let profileFormBaseline = '';
+let closeOnMediaJobComplete = false;
+let mediaJobSeenActive = false;
+let mediaJobWaitDeadlineMs = 0;
+let toastTimer = null;
+let migrationPollTimer = null;
+let migrationRequestInFlight = false;
+
+function authAwareMessage(xhr, fallback) {
+    if (xhr && xhr.status === 401) {
+        return 'Authorization required. Open Timelapse from the camera web UI as an administrator.';
+    }
+    return fallback;
+}
+
+function showModal(id) {
+    bootstrap.Modal.getOrCreateInstance(document.getElementById(id)).show();
+}
+
+function hideModal(id) {
+    bootstrap.Modal.getOrCreateInstance(document.getElementById(id)).hide();
+}
+
+function showBusy(message) {
+    $('#busyModalText').text(message || 'Please wait...');
+    $('#busyModalProgressBar').css('width', '0%').text('0%');
+    showModal('busyModal');
+}
+
+function hideBusy() {
+    hideModal('busyModal');
+}
+
+function showToast(message, type) {
+    const toast = $('#feedbackToast');
+    const isError = type === 'error';
+    toast.stop(true, true);
+    toast.toggleClass('tl-toast-error', isError);
+    toast.toggleClass('tl-toast-success', !isError);
+    toast.text(message || 'Done').fadeIn(120);
+    if (toastTimer) {
+        clearTimeout(toastTimer);
+    }
+    toastTimer = setTimeout(function() {
+        toast.fadeOut(220);
+        toastTimer = null;
+    }, 3000);
+}
+
+function stopMediaJobPolling() {
+    if (mediaJobUiTimer) {
+        clearInterval(mediaJobUiTimer);
+        mediaJobUiTimer = null;
+    }
+    if (mediaJobStatusTimer) {
+        clearInterval(mediaJobStatusTimer);
+        mediaJobStatusTimer = null;
+    }
+    mediaJobRequestInFlight = false;
+}
+
+function renderMigrationState(state) {
+    const status = state.status || 'complete';
+    const total = Number(state.total || 0);
+    const completed = Number(state.completed || 0);
+    const currentIndex = Number(state.currentIndex || 0);
+    const fileProgress = Math.min(100, Math.max(0, Number(state.fileProgress || 0)));
+
+    let percent = total > 0 ? Math.min(100, Math.max(0, (completed / total) * 100)) : (status === 'complete' ? 100 : 0);
+    if (status === 'running' && total > 0) {
+        const inFileProgress = fileProgress / 100;
+        percent = Math.min(99, ((completed + inFileProgress) / total) * 100);
+    }
+    const percentText = percent.toFixed(1);
+    const fileProgressText = fileProgress.toFixed(1);
+
+    $('#migrationMessage').text(state.message || 'AVI recordings must be converted to MP4.');
+    $('#migrationCurrent').text(state.current ? 'Processing file ' + (currentIndex || completed + 1).toLocaleString() + ' of ' + total.toLocaleString() + ': ' + state.current : (status === 'pending' ? 'Waiting for your decision.' : ''));
+    $('#migrationCount').text(completed.toLocaleString() + ' of ' + total.toLocaleString() + ' files converted');
+    $('#migrationCurrentFileProgress').toggle(status === 'running');
+    $('#migrationFileProgressText').text(fileProgressText + '%');
+    $('#migrationFileProgressBar').css('width', fileProgress + '%').text(fileProgressText + '%');
+    $('#migrationOverallProgressText').text(percentText + '%');
+    $('#migrationProgressBar').css('width', percent + '%').text(percentText + '%');
+    $('#startMigrationBtn').toggle(status !== 'running' && status !== 'cancelling').prop('disabled', false);
+    $('#rollbackMigrationBtn').show().prop('disabled', status === 'cancelling');
+
+    if (status === 'running') {
+        $('#rollbackMigrationBtn').text('Cancel migration');
+    } else if (status === 'cancelling') {
+        $('#rollbackMigrationBtn').text('Cancelling...');
+    } else if (status === 'failed') {
+        $('#startMigrationBtn').prop('disabled', false).text('Retry conversion');
+        $('#rollbackMigrationBtn').text('Cancel and keep AVI');
+    } else if (status === 'cancelled' || status === 'declined') {
+        $('#startMigrationBtn').text('Convert to MP4');
+        $('#rollbackMigrationBtn').text('AVI kept');
+    } else {
+        $('#startMigrationBtn').text('Convert to MP4');
+        $('#rollbackMigrationBtn').text('Cancel and keep AVI');
+    }
+}
+
+function stopMigrationPolling() {
+    if (migrationPollTimer) {
+        clearInterval(migrationPollTimer);
+        migrationPollTimer = null;
+    }
+    migrationRequestInFlight = false;
+}
+
+function pollMigrationState() {
+    if (migrationRequestInFlight) {
+        return;
+    }
+    migrationRequestInFlight = true;
+    $.ajax({
+        url: 'migration',
+        method: 'GET',
+        cache: false,
+        dataType: 'json',
+        success: function(state) {
+            migrationRequestInFlight = false;
+            if (!state || !state.required || state.status === 'complete') {
+                stopMigrationPolling();
+                hideModal('migrationModal');
+                loadRecordings();
+                return;
+            }
+
+            renderMigrationState(state);
+            showModal('migrationModal');
+        },
+        error: function(xhr) {
+            migrationRequestInFlight = false;
+            $('#recordings-list').html('<tr><td colspan="7" class="tl-empty"><strong>Initializing</strong>Please wait while Timelapse checks storage and compatibility.</td></tr>');
+            if (!migrationPollTimer) {
+                migrationPollTimer = setInterval(pollMigrationState, 1000);
+            }
+        }
+    });
+}
+
+function checkMigrationThenLoad() {
+    pollMigrationState();
+}
+
+function startMigration() {
+    $.ajax({
+        url: 'migration',
+        method: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify({ action: 'start' }),
+        success: function() {
+            pollMigrationState();
+            if (!migrationPollTimer) {
+                migrationPollTimer = setInterval(pollMigrationState, 1000);
+            }
+        },
+        error: function() { showToast('Failed to start AVI migration.', 'error'); }
+    });
+}
+
+function declineMigration() {
+    $.ajax({
+        url: 'migration',
+        method: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify({ action: 'decline' }),
+        complete: function() {
+            renderMigrationState({
+                required: true,
+                status: 'declined',
+                total: 0,
+                completed: 0,
+                message: 'Migration cancelled. No AVI files were changed. Reinstall version 2.x.x to continue using AVI recordings.',
+                current: ''
+            });
+            showModal('migrationModal');
+        }
+    });
+}
+
+function renderMediaJobProgress() {
+    const elapsedSec = Math.max(1, Math.floor((Date.now() - mediaJobClientStartMs) / 1000));
+    let displayProgress = Math.max(1, mediaJobProgress);
+
+    if (mediaJobEstimateSec > 0) {
+        displayProgress = Math.min(98, Math.max(displayProgress, (elapsedSec / mediaJobEstimateSec) * 100));
+    } else {
+        // Fallback when no estimate is available yet: steadily advance, capped until completion.
+        displayProgress = Math.min(95, Math.max(displayProgress, 5 + (elapsedSec * 2)));
+    }
+
+    const percent = Math.min(100, Math.max(0, displayProgress));
+    const percentText = percent.toFixed(1);
+    $('#busyModalText').text(mediaJobStage);
+    $('#busyModalProgressBar').css('width', percent + '%').text(percentText + '%');
+}
+
+function pollMediaJobStatus() {
+    if (mediaJobRequestInFlight) {
+        return;
+    }
+
+    mediaJobRequestInFlight = true;
+    $.ajax({
+        url: 'status',
+        method: 'GET',
+        cache: false,
+        timeout: 1200,
+        dataType: 'json',
+        success: function(resp) {
+            const media = resp && resp.mediaJob ? resp.mediaJob : null;
+            if (media && media.active) {
+                mediaJobKind = media.kind || '';
+                mediaJobStage = media.stage || 'Processing';
+                mediaJobEstimateSec = Number(media.estimatedSeconds || 0);
+                mediaJobProgress = Number(media.progress || 0);
+                mediaJobSeenActive = true;
+            } else if (closeOnMediaJobComplete && mediaJobSeenActive) {
+                mediaJobStage = 'Processing complete';
+                mediaJobProgress = 100;
+                renderMediaJobProgress();
+                closeOnMediaJobComplete = false;
+                const failed = media && Number(media.progress || 0) <= 0 && /fail|error/i.test(media.message || '');
+                const message = failed ? (media.message || 'Processing failed.') : mediaJobCompleteToast;
+                setTimeout(function() {
+                    stopMediaJobPolling();
+                    hideBusy();
+                    hideModal('timelapseModal');
+                    loadRecordings();
+                    showToast(message, failed ? 'error' : 'success');
+                }, 500);
+            } else if (closeOnMediaJobComplete && !mediaJobSeenActive && Date.now() >= mediaJobWaitDeadlineMs) {
+                mediaJobStage = 'Processing complete';
+                mediaJobProgress = 100;
+                renderMediaJobProgress();
+                closeOnMediaJobComplete = false;
+                setTimeout(function() {
+                    stopMediaJobPolling();
+                    hideBusy();
+                    hideModal('timelapseModal');
+                    loadRecordings();
+                    showToast(mediaJobFallbackToast, 'success');
+                }, 300);
+            }
+        },
+        complete: function() {
+            mediaJobRequestInFlight = false;
+        }
+    });
+}
+
+function startMediaJobPolling() {
+    stopMediaJobPolling();
+    mediaJobClientStartMs = Date.now();
+    mediaJobStage = 'Saving recording...';
+    mediaJobEstimateSec = 0;
+    mediaJobProgress = 0;
+    mediaJobKind = '';
+    mediaJobCompleteToast = 'Recording updated and media processing completed.';
+    mediaJobFallbackToast = 'Recording updated.';
+    closeOnMediaJobComplete = false;
+    mediaJobSeenActive = false;
+    mediaJobWaitDeadlineMs = 0;
+
+    renderMediaJobProgress();
+    mediaJobUiTimer = setInterval(renderMediaJobProgress, 1000);
+    mediaJobStatusTimer = setInterval(pollMediaJobStatus, 2000);
+    pollMediaJobStatus();
+}
+
+function currentFormSignature() {
+    const triggerType = $('#triggerType-event').is(':checked') ? 'event' : 'timer';
+    return JSON.stringify({
+        id: $('#edit-id').val() || '',
+        name: $('#name').val() || '',
+        resolution: $('#resolution').val() || '',
+        fps: String($('#fps').val() || ''),
+        overlay: $('#overlay').val() || '',
+        conditions: $('#conditions').val() || '',
+        archiveSchedule: $('#archive-schedule').val() || '',
+        expectedImagesPerDay: String($('#expected-images-per-day').val() || ''),
+        archived: String($('#archived').val() || ''),
+        triggerType: triggerType,
+        triggerEvent: $('#trigger-event').val() || '',
+        timerValue: String($('#timer-value').val() || ''),
+        timerUnit: String($('#timer-unit').val() || '')
+    });
+}
+
+function formIsSavable() {
+    if (!($('#name').val() || '').trim()) {
+        return false;
+    }
+    if (!($('#resolution').val() || '').trim()) {
+        return false;
+    }
+    if ($('#triggerType-event').is(':checked')) {
+        return !!($('#trigger-event').val() || '').trim();
+    }
+    const timerValue = parseInt($('#timer-value').val(), 10);
+    const timerUnit = parseInt($('#timer-unit').val(), 10);
+    return !!(timerValue > 0 && timerUnit > 0);
+}
+
+function updateSaveButtonVisibility() {
+    const dirty = currentFormSignature() !== profileFormBaseline;
+    const show = dirty && formIsSavable();
+    $('#saveProfileBtn').toggleClass('d-none', !show);
+}
+
+function captureFormBaseline() {
+    profileFormBaseline = currentFormSignature();
+    updateSaveButtonVisibility();
+}
+
+function setBrandName(name) {
+    document.title = name;
+    $('.tl-brand-text').text(name);
+}
 
 function pollSdcardStatus() {
-    var intervalId = null;
+    let intervalId = null;
+
     function checkStatus() {
         $.ajax({
             url: 'status',
@@ -148,208 +601,718 @@ function pollSdcardStatus() {
                         clearInterval(intervalId);
                         intervalId = null;
                     }
-                } else {
-                    let msg = resp && resp.sdcard && resp.sdcard.message ? resp.sdcard.message : 'Initializing, please wait...';
-                    $('#init-message').text(msg).fadeIn();
-                    if (!intervalId) {
-                        intervalId = setInterval(checkStatus, 1000);
-                    }
+                    return;
+                }
+
+                const msg = resp && resp.sdcard && resp.sdcard.message ? resp.sdcard.message : 'Initializing storage, please wait...';
+                $('#init-message').text(msg).fadeIn();
+                if (!intervalId) {
+                    intervalId = setInterval(checkStatus, 1000);
                 }
             },
             error: function() {
-                $('#init-message').text('Initializing, please wait...').fadeIn();
+                $('#init-message').text('Initializing storage, please wait...').fadeIn();
                 if (!intervalId) {
                     intervalId = setInterval(checkStatus, 1000);
                 }
             }
         });
     }
+
     checkStatus();
 }
 
 $(document).ready(function() {
-    let currentProfileId = null;
-    let currentImageIndex = 1;
-    let totalImages = 0;
-
     pollSdcardStatus();
+    $('#timer-value').val(10);
+    $('#timer-unit').val(60);
 
-    // Fetch app details
     $.ajax({
         type: 'GET',
         url: 'app',
         dataType: 'json',
         cache: false,
         success: function(app) {
-            document.title = app.manifest.acapPackageConf.setup.friendlyName;
-            $('.sidebar-heading').text(app.manifest.acapPackageConf.setup.friendlyName);
+            setBrandName(app.manifest.acapPackageConf.setup.friendlyName);
         },
-        error: function(response) {
-            $('#errorModal').modal('show');
+        error: function() {
+            showModal('errorModal');
         }
     });
 
-    function formatDate(timestamp) {
-        if (!timestamp) return 'N/A';
-        return new Date(timestamp).toLocaleDateString();
-    }
+    loadResolutions();
+    loadEvents();
 
-    // Fetch both profiles and recordings
-    Promise.all([
-        $.ajax({ url: 'timelapse', type: 'GET' }),
-        $.ajax({ url: 'recordings', type: 'GET' })
-    ]).then(function([profiles, recordings]) {
-        TimelapseRecordings = recordings;
-        const tbody = $('#recordings-list');
-        tbody.empty();
-
-        Object.entries(recordings).forEach(([id, recording]) => {
-            const profile = profiles.find(p => p.id === id) || { name: 'Unknown Profile' };
-            var tr = '<tr>';
-            tr += '<td>' + profile.name + '</td>';
-            tr += '<td>' + recording.images + '</td>';
-            tr += '<td>' + formatFileSize(recording.size) + '</td>';
-            tr += '<td>' + formatDate(recording.last) + '</td>';
-            tr += '<td>' + formatDate(recording.first) + '</td>';
-            tr += '<td>';
-            tr += '<button class="btn btn-sm btn-primary me-1" onclick="exportRecording(\'' + id + '\')">Download</button>';
-            tr += '<button class="btn btn-sm btn-success me-1" onclick="inspectRecording(\'' + id + '\')">Inspect</button>';
-            tr += '<button class="btn btn-sm btn-warning me-1" onclick="archiveRecording(\'' + id + '\')">Archive</button>'; // New Archive button
-            tr += '<button class="btn btn-sm btn-danger" onclick="flushRecording(\'' + id + '\')">Delete</button>';
-            tr += '</td>';
-            tr += '</tr>';
-            tbody.append(tr);
-        });
+    $('#refreshBtn').on('click', checkMigrationThenLoad);
+    $('#startMigrationBtn').on('click', startMigration);
+    $('#rollbackMigrationBtn').on('click', declineMigration);
+    $('#addProfileBtn').on('click', function() {
+        resetProfileForm();
+        $('#timelapseModalLabel').text('Add recording');
+        showModal('timelapseModal');
     });
 
-    function loadImage(index) {
-        $('#inspectImage').attr('src', 'image?id=' + currentProfileId + '&index=' + index);
-        $('#imageSlider').val(index);
-        currentImageIndex = index;
-    }
-
-    window.inspectRecording = function(id) {
-        currentProfileId = id;
-        currentImageIndex = 1;
-        $.ajax({
-            url: 'recordings?id=' + id,
-            type: 'GET',
-            success: function(data) {
-                totalImages = data.images;
-                $('#imageSlider').attr('max', totalImages);
-                loadImage(1);
-                $('#inspectModal').modal('show');
-            }
-        });
-    };
-
-    window.exportRecording = function(id) {
-        // Get profile name from the table
-        const profileName = $(`tr:has(button[onclick="exportRecording('${id}')"])`).find('td:first').text();
-        const filename = profileName.replace(/\s+/g, '_') + '.avi';
-        var recording = TimelapseRecordings[id];
-        if( recording.hasOwnProperty("fps") )
-            $('#exportFps').val( recording.fps);
-        else
-            $('#exportFps').val( 10 );
-        $('#exportFilename').val(filename);
-        $('#exportProfileId').val(id);
-        $('#exportModal').modal('show');
-    };
-
-    $('#exportDownloadBtn').click(function() {
-        const filename = $('#exportFilename').val();
-        const fps = $('#exportFps').val();
-        const profileId = $('#exportProfileId').val();
-
-        // Create form for file download
-        const form = document.createElement('form');
-        form.method = 'GET';
-        form.action = 'export';
-
-        // Add hidden fields for parameters
-        const idField = document.createElement('input');
-        idField.type = 'hidden';
-        idField.name = 'id';
-        idField.value = profileId;
-        form.appendChild(idField);
-
-        const fpsField = document.createElement('input');
-        fpsField.type = 'hidden';
-        fpsField.name = 'fps';
-        fpsField.value = fps;
-        form.appendChild(fpsField);
-
-        const filenameField = document.createElement('input');
-        filenameField.type = 'hidden';
-        filenameField.name = 'filename';
-        filenameField.value = filename;
-        form.appendChild(filenameField);
-
-        document.body.appendChild(form);
-        form.submit();
-        document.body.removeChild(form);
-        $('#exportModal').modal('hide');
-    });
-
-    window.flushRecording = function(id) {
-        $.ajax({
-            type: 'DELETE',
-            url: 'recordings?id=' + id,
-            success: function() {
-                location.reload();
-            }
-        });
-    };
-
-    window.archiveRecording = function(profileId) {
-        $.ajax({
-            type: 'PUT',
-            url: `archive?id=${encodeURIComponent(profileId)}`,
-            success: function() {
-                alert('Recording archived successfully');
-                location.reload(); // Reload the page to update the recordings list
-            },
-            error: function() {
-                alert('Failed to archive recording');
-            }
-        });
-    };
-
-
-    $('#prevButton').click(function() {
-        if (currentImageIndex > 1) {
-            loadImage(currentImageIndex - 1);
+    $('input[name="triggerType"]').on('change', function() {
+        const isEvent = $('#triggerType-event').is(':checked');
+        $('#event-section').toggleClass('d-none', !isEvent);
+        $('#timer-section').toggleClass('d-none', isEvent);
+        if (isEvent) {
+            $('#timer-value').val('');
+        } else if (eventSelect) {
+            eventSelect.clear();
         }
+        updateArchiveGuide();
     });
 
-    $('#nextButton').click(function() {
-        if (currentImageIndex < totalImages) {
-            loadImage(currentImageIndex + 1);
-        }
+    $('#timer-value, #timer-unit, #archive-schedule, #expected-images-per-day').on('input change', updateArchiveGuide);
+    $('#timelapse-form').on('input change', updateSaveButtonVisibility);
+    $('#timelapse-form').on('submit', saveProfile);
+    $('#timelapseModal').on('hidden.bs.modal', resetProfileForm);
+
+    $('#recordings-list').on('click', 'button[data-action]', function() {
+        const id = $(this).data('id');
+        const filename = $(this).data('filename');
+        const action = $(this).data('action');
+
+        if (action === 'play') playRecording(id);
+        if (action === 'download') exportRecording(id);
+        if (action === 'play-archive') playArchive(filename);
+        if (action === 'download-archive') downloadArchive(filename);
+        if (action === 'archive') archiveRecording(id);
+        if (action === 'reset-live') resetLiveMedia(id);
+        if (action === 'delete-live') deleteLiveRecording(id);
+        if (action === 'edit') editTimelapse(id);
+        if (action === 'delete-archive') deleteArchive(filename);
     });
 
-    $('#imageSlider').on('input', function() {
-        loadImage(parseInt($(this).val()));
-    });
+    $('#recordings-list')
+        .on('show.bs.dropdown', '.dropdown', function() {
+            $(this).closest('.table-responsive').addClass('tl-dropdown-open');
+        })
+        .on('hidden.bs.dropdown', '.dropdown', function() {
+            $(this).closest('.table-responsive').removeClass('tl-dropdown-open');
+        });
 
-    $('#downloadButton').click(function() {
-        window.location.href = 'download?id=' + currentProfileId + '&index=' + currentImageIndex;
+    $('#playModal').on('hidden.bs.modal', function() {
+        const video = document.getElementById('playVideo');
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
     });
+    checkMigrationThenLoad();
 });
 
-function formatFileSize(bytes) {
-    if (!bytes) return '0 KB';
+function loadResolutions() {
+    $.ajax({
+        type: 'GET',
+        url: '/axis-cgi/param.cgi?action=list&group=Properties.Image.Resolution',
+        dataType: 'text',
+        cache: false,
+        success: function(data) {
+            const resolutionsString = (data.split('=')[1] || '').trim();
+            const dropdown = document.getElementById('resolution');
+            dropdown.innerHTML = '';
+            resolutionsString.split(',').filter(Boolean).forEach(function(resolution) {
+                const option = document.createElement('option');
+                option.value = resolution;
+                option.textContent = resolution;
+                dropdown.appendChild(option);
+            });
+        }
+    });
+}
 
-    if (bytes < 1024 * 1024) {
-        return (bytes / 1024).toFixed(1) + ' KB';
-    } else if (bytes < 1024 * 1024 * 1024) {
-        return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+function loadEvents() {
+    listEvents()
+        .then(function(events) {
+            availableEvents = events || [];
+            if (eventSelect) {
+                eventSelect.destroy();
+            }
+            eventSelect = new TomSelect(document.getElementById('trigger-event'), {
+                maxItems: 1,
+                valueField: 'name',
+                labelField: 'name',
+                searchField: 'name',
+                options: availableEvents,
+                create: false,
+                plugins: ['clear_button']
+            });
+        })
+        .catch(function(error) {
+            console.error('Failed to fetch events:', error);
+        });
+}
+
+function loadRecordings() {
+    $('#recordings-list').html('<tr><td colspan="7" class="tl-empty"><strong>Loading recordings</strong>Please wait while the camera reports active and archived media.</td></tr>');
+
+    Promise.all([
+        $.ajax({ url: 'timelapse', type: 'GET', cache: false }),
+        $.ajax({ url: 'recordings', type: 'GET', cache: false }),
+        $.ajax({ url: 'archive', type: 'GET', cache: false })
+    ]).then(function([profiles, recordings, archives]) {
+        timelapseProfiles = profiles || [];
+        timelapseRecordings = recordings || {};
+        timelapseArchives = archives || [];
+        renderRecordings();
+    }).catch(function(xhr) {
+        const message = authAwareMessage(xhr, 'The camera did not return recording data.');
+        $('#recordings-list').html('<tr><td colspan="7" class="tl-empty"><strong>Recordings unavailable</strong>' + message + '</td></tr>');
+    });
+}
+
+function renderRecordings() {
+    const tbody = $('#recordings-list');
+    tbody.empty();
+
+    const profiles = timelapseProfiles || [];
+    const archives = timelapseArchives || [];
+
+    if (!profiles.length && !archives.length) {
+        tbody.append('<tr><td colspan="7" class="tl-empty"><strong>No recordings yet</strong>Active captures and completed archives will appear here.</td></tr>');
+        return;
+    }
+
+    profiles.forEach(function(profile) {
+        const id = profile.id;
+        const recording = timelapseRecordings[id] || {};
+        const hasFrames = (recording.images || 0) > 0;
+        const row = $('<tr>');
+        const typeCell = $('<td>').append($('<span class="tl-badge">').text('Live'));
+        const profileCell = $('<td>').append(
+            $('<div class="tl-name-cell">').append(
+                $('<span class="tl-name-primary">').text(profile.name),
+                $('<span class="tl-name-secondary">').text((profile.resolution || 'Resolution not set') + ' @ ' + ((profile.fps || 10) + ' fps'))
+            )
+        );
+        const actionCell = $('<td>');
+        const actions = $('<div class="tl-actions">');
+
+        const menuItems = [];
+        if (hasFrames) {
+            menuItems.push({ action: 'play', id: id, label: 'Play' });
+            menuItems.push({ action: 'download', id: id, label: 'Export MP4' });
+            if ((profile.archiveSchedule || 'monthly') !== 'none') {
+                menuItems.push({ action: 'archive', id: id, label: 'Archive now' });
+            }
+            menuItems.push({ action: 'reset-live', id: id, label: 'Reset media' });
+        }
+        menuItems.push({ action: 'edit', id: id, label: 'Edit settings' });
+        menuItems.push({ action: 'delete-live', id: id, label: 'Delete recording' });
+        actions.append(actionMenu(menuItems));
+        actionCell.append(actions);
+
+        row.append(typeCell)
+            .append(profileCell)
+            .append($('<td>').text((recording.images || 0).toLocaleString()))
+            .append($('<td>').text(formatFileSize(recording.size)))
+            .append($('<td>').text(formatDate(recording.last)))
+            .append($('<td>').text(formatDays(recording.first, Date.now())))
+            .append(actionCell);
+        tbody.append(row);
+    });
+
+    archives.forEach(function(archive) {
+        const filename = archive.filename;
+        const row = $('<tr>');
+        const typeCell = $('<td>').append($('<span class="tl-badge warm">').text('Archive'));
+        const nameCell = $('<td>').append(
+            $('<div class="tl-name-cell">').append(
+                $('<span class="tl-name-primary">').text(filename),
+                $('<span class="tl-name-secondary">').text('MP4 archive')
+            )
+        );
+        const actions = $('<div class="tl-actions">').append(actionMenu([
+            { action: 'play-archive', filename: filename, label: 'Play' },
+            { action: 'download-archive', filename: filename, label: 'Download MP4' },
+            { action: 'delete-archive', filename: filename, label: 'Delete archive' }
+        ]));
+
+        row.append(typeCell)
+            .append(nameCell)
+            .append($('<td>').text((archive.frames || 0).toLocaleString()))
+            .append($('<td>').text(formatFileSize(archive.size)))
+            .append($('<td>').text(formatDate(archive.last)))
+            .append($('<td>').text(formatDays(archive.first, archive.last)))
+            .append($('<td>').append(actions));
+        tbody.append(row);
+    });
+}
+
+function actionMenu(items) {
+    const wrap = $('<div class="dropdown">');
+    const button = $('<button type="button" class="btn btn-sm btn-outline-primary tl-menu-btn dropdown-toggle">')
+        .attr('data-bs-toggle', 'dropdown')
+        .attr('data-bs-boundary', 'viewport')
+        .attr('data-bs-popper-config', '{"strategy":"fixed"}')
+        .attr('aria-expanded', 'false')
+        .append($('<span class="tl-icon" aria-hidden="true">').text('...'))
+        .append($('<span class="visually-hidden">').text('Open actions'));
+    const menu = $('<ul class="dropdown-menu dropdown-menu-end">');
+
+    items.forEach(function(item) {
+        const entry = $('<li>').append(
+            $('<button type="button" class="dropdown-item">')
+                .attr('data-action', item.action)
+                .attr('data-id', item.id || '')
+                .attr('data-filename', item.filename || '')
+                .text(item.label)
+        );
+        menu.append(entry);
+    });
+
+    wrap.append(button).append(menu);
+    return wrap;
+}
+
+function playRecording(id) {
+    const recording = timelapseRecordings[id] || {};
+    const fps = recording.fps || 10;
+    const video = document.getElementById('playVideo');
+    video.pause();
+
+    showBusy('Preparing video');
+    startMediaJobPolling();
+    mediaJobStage = 'Preparing video';
+    mediaJobProgress = 1;
+    renderMediaJobProgress();
+
+    let settled = false;
+    let timeoutId = null;
+
+    const cleanupHandlers = function() {
+        video.onloadeddata = null;
+        video.oncanplay = null;
+        video.onerror = null;
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+            timeoutId = null;
+        }
+    };
+
+    const onReady = function() {
+        if (settled) return;
+        settled = true;
+        cleanupHandlers();
+        stopMediaJobPolling();
+        hideBusy();
+        showModal('playModal');
+    };
+
+    const onError = function() {
+        if (settled) return;
+        settled = true;
+        cleanupHandlers();
+        stopMediaJobPolling();
+        hideBusy();
+        showToast('Failed to prepare video.', 'error');
+    };
+
+    video.onloadeddata = onReady;
+    video.oncanplay = onReady;
+    video.onerror = onError;
+
+    timeoutId = setTimeout(function() {
+        onError();
+    }, 120000);
+
+    video.currentTime = 0;
+    video.src = 'video?id=' + encodeURIComponent(id) + '&fps=' + encodeURIComponent(fps) + '&_=' + Date.now();
+    video.load();
+}
+
+function playArchive(filename) {
+    const video = document.getElementById('playVideo');
+    video.pause();
+
+    showBusy('Loading archive');
+
+    let settled = false;
+    let timeoutId = null;
+
+    const cleanupHandlers = function() {
+        video.onloadeddata = null;
+        video.oncanplay = null;
+        video.onerror = null;
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+            timeoutId = null;
+        }
+    };
+
+    const onReady = function() {
+        if (settled) return;
+        settled = true;
+        cleanupHandlers();
+        hideBusy();
+        showModal('playModal');
+    };
+
+    const onError = function() {
+        if (settled) return;
+        settled = true;
+        cleanupHandlers();
+        hideBusy();
+        showToast('Failed to load archive.', 'error');
+    };
+
+    video.onloadeddata = onReady;
+    video.oncanplay = onReady;
+    video.onerror = onError;
+
+    timeoutId = setTimeout(function() {
+        onError();
+    }, 30000);
+
+    video.currentTime = 0;
+    video.src = 'download?inline=1&filename=' + encodeURIComponent(filename) + '&_=' + Date.now();
+    video.load();
+}
+
+function exportRecording(id) {
+    showBusy('Preparing export...');
+    const form = document.createElement('form');
+    form.method = 'GET';
+    form.action = 'export';
+
+    appendHiddenField(form, 'id', id);
+
+    document.body.appendChild(form);
+    form.submit();
+    document.body.removeChild(form);
+    setTimeout(hideBusy, 1200);
+}
+
+function saveProfile(e) {
+    e.preventDefault();
+
+    if (currentFormSignature() === profileFormBaseline) {
+        hideModal('timelapseModal');
+        return;
+    }
+
+    const formData = {
+        id: $('#edit-id').val() || generateID(),
+        name: $('#name').val(),
+        resolution: $('#resolution').val(),
+        conditions: $('#conditions').val(),
+        fps: parseInt($('#fps').val(), 10),
+        archived: parseInt($('#archived').val() || '0', 10),
+        archiveSchedule: $('#archive-schedule').val(),
+        expectedImagesPerDay: parseInt($('#expected-images-per-day').val(), 10),
+        overlay: $('#overlay').val() === 'true'
+    };
+
+    const existing = timelapseProfiles.find(function(candidate) { return candidate.id === formData.id; });
+    const oldFps = existing ? parseInt(existing.fps || 10, 10) : formData.fps;
+    const existingRecording = timelapseRecordings[formData.id] || {};
+    const hasRecordingMedia = Number(existingRecording.images || existingRecording.frames || 0) > 0;
+    const expectBackgroundReencode = !!existing && oldFps !== formData.fps && hasRecordingMedia;
+
+    const isEvent = $('#triggerType-event').is(':checked');
+    if (isEvent) {
+        const selectedEventName = $('#trigger-event').val();
+        const fullEvent = availableEvents.find(function(event) { return event.name === selectedEventName; });
+        if (!fullEvent) {
+            showToast('Select an event trigger before saving.', 'error');
+            return;
+        }
+
+        const triggerEvent = { name: fullEvent.name };
+        Object.keys(fullEvent).forEach(function(key) {
+            if (key.startsWith('topic')) {
+                triggerEvent[key] = fullEvent[key];
+            }
+        });
+        formData.triggerEvent = triggerEvent;
+        formData.timer = null;
     } else {
-        return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+        const timerValue = parseInt($('#timer-value').val(), 10);
+        const timerUnit = parseInt($('#timer-unit').val(), 10);
+        if (!timerValue || !timerUnit) {
+            showToast('Enter a timer interval before saving.', 'error');
+            return;
+        }
+        formData.timer = timerValue * timerUnit;
+        formData.triggerEvent = null;
+    }
+
+    const saveButton = $('#saveProfileBtn');
+    saveButton.prop('disabled', true).text('Saving...');
+
+    $.ajax({
+        type: 'POST',
+        url: 'timelapse',
+        contentType: 'application/json',
+        data: JSON.stringify(formData),
+        success: function() {
+            if (expectBackgroundReencode) {
+                showBusy('Updating media for FPS change...');
+                startMediaJobPolling();
+                mediaJobStage = 'Re-encoding export for FPS change';
+                closeOnMediaJobComplete = true;
+                mediaJobWaitDeadlineMs = Date.now() + 4000;
+                return;
+            }
+
+            hideModal('timelapseModal');
+            loadRecordings();
+            showToast('Recording settings saved.', 'success');
+        },
+        error: function() {
+            closeOnMediaJobComplete = false;
+            stopMediaJobPolling();
+            hideBusy();
+            showToast('Failed to save recording.', 'error');
+        },
+        complete: function() {
+            saveButton.prop('disabled', false).text('Save recording');
+        }
+    });
+}
+
+function resetProfileForm() {
+    const form = document.getElementById('timelapse-form');
+    if (form) {
+        form.reset();
+    }
+    $('#edit-id').val('');
+    $('#archived').val('0');
+    $('#fps').val(10);
+    $('#timer-value').val(10);
+    $('#timer-unit').val(60);
+    $('#archive-schedule').val('monthly');
+    $('#expected-images-per-day').val(1);
+    $('#triggerType-event').prop('checked', true);
+    $('#event-section').removeClass('d-none');
+    $('#timer-section').addClass('d-none');
+    if (eventSelect) {
+        eventSelect.clear();
+    }
+    updateArchiveGuide();
+    captureFormBaseline();
+}
+
+function editTimelapse(profileId) {
+    const profile = timelapseProfiles.find(function(candidate) { return candidate.id === profileId; });
+    if (!profile) return;
+
+    resetProfileForm();
+    $('#timelapseModalLabel').text('Edit recording');
+    $('#edit-id').val(profile.id);
+    $('#name').val(profile.name);
+    $('#resolution').val(profile.resolution);
+    $('#fps').val(profile.fps || 10);
+    $('#archived').val(profile.archived || 0);
+    $('#archive-schedule').val(profile.archiveSchedule || archiveScheduleFromDays(profile.archiveIntervalDays));
+    $('#expected-images-per-day').val(profile.expectedImagesPerDay || estimateImagesPerDay(profile.timer));
+    $('#conditions').val(profile.conditions || 'any');
+    $('#overlay').val(profile.overlay ? 'true' : 'false');
+
+    if (profile.triggerEvent) {
+        $('#triggerType-event').prop('checked', true);
+        $('#event-section').removeClass('d-none');
+        $('#timer-section').addClass('d-none');
+        if (eventSelect) {
+            eventSelect.setValue(profile.triggerEvent.name);
+        }
+    } else if (profile.timer) {
+        $('#triggerType-timer').prop('checked', true);
+        $('#event-section').addClass('d-none');
+        $('#timer-section').removeClass('d-none');
+        setTimerFields(profile.timer);
+    }
+
+    updateArchiveGuide();
+    captureFormBaseline();
+    showModal('timelapseModal');
+}
+
+function appendHiddenField(form, name, value) {
+    const field = document.createElement('input');
+    field.type = 'hidden';
+    field.name = name;
+    field.value = value;
+    form.appendChild(field);
+}
+
+function resetLiveMedia(id) {
+    if (!confirm('Delete captured frames and generated videos for this recording? The timer and settings are kept.')) {
+        return;
+    }
+
+    showBusy('Resetting recording media...');
+    startMediaJobPolling();
+    mediaJobStage = 'Resetting recording media';
+    mediaJobProgress = 1;
+    mediaJobCompleteToast = 'Recording media reset.';
+    mediaJobFallbackToast = 'Recording media reset started.';
+    renderMediaJobProgress();
+
+    $.ajax({
+        type: 'DELETE',
+        url: 'recordings?id=' + encodeURIComponent(id),
+        success: function() {
+            closeOnMediaJobComplete = true;
+            mediaJobWaitDeadlineMs = Date.now() + 4000;
+        },
+        error: function() {
+            stopMediaJobPolling();
+            hideBusy();
+            showToast('Failed to reset recording media.', 'error');
+        }
+    });
+}
+
+function deleteLiveRecording(id) {
+    if (!confirm('Delete this recording, its timer/settings, captured frames, generated videos, and archives?')) {
+        return;
+    }
+
+    showBusy('Deleting recording...');
+
+    $.ajax({
+        type: 'DELETE',
+        url: 'timelapse?id=' + encodeURIComponent(id),
+        success: function() {
+            hideBusy();
+            loadRecordings();
+            showToast('Recording deleted.', 'success');
+        },
+        error: function() {
+            hideBusy();
+            showToast('Failed to delete recording.', 'error');
+        }
+    });
+}
+
+function archiveRecording(profileId) {
+    if (!confirm('Archive this recording now? The active frames are cleared after a successful archive.')) {
+        return;
+    }
+
+    showBusy('Archiving recording...');
+
+    $.ajax({
+        type: 'PUT',
+        url: 'archive?id=' + encodeURIComponent(profileId),
+        success: function() {
+            hideBusy();
+            loadRecordings();
+            showToast('Recording archived.', 'success');
+        },
+        error: function() {
+            hideBusy();
+            showToast('Failed to archive recording.', 'error');
+        }
+    });
+}
+
+function downloadArchive(filename) {
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = 'download?filename=' + encodeURIComponent(filename);
+    document.body.appendChild(iframe);
+    setTimeout(function() {
+        document.body.removeChild(iframe);
+    }, 2000);
+}
+
+function deleteArchive(filename) {
+    if (!confirm('Delete ' + filename + '?')) {
+        return;
+    }
+
+    $.ajax({
+        type: 'DELETE',
+        url: 'archive?filename=' + encodeURIComponent(filename),
+        success: function() {
+            loadRecordings();
+            showToast('Archive deleted.', 'success');
+        },
+        error: function() { showToast('Failed to delete archive.', 'error'); }
+    });
+}
+
+function formatDate(timestamp) {
+    if (!timestamp) return 'N/A';
+    const date = new Date(timestamp);
+    return date.toLocaleDateString('sv-SE');
+}
+
+function formatDays(first, end) {
+    const firstMs = Number(first || 0);
+    if (firstMs <= 0) return 'N/A';
+    const endMs = Number(end || Date.now());
+    const dayMs = 24 * 60 * 60 * 1000;
+    const days = Math.max(1, Math.ceil(Math.max(0, endMs - firstMs) / dayMs));
+    return days.toLocaleString() + ' ' + (days === 1 ? 'day' : 'days');
+}
+
+function setTimerFields(seconds) {
+    if (seconds % 3600 === 0) {
+        $('#timer-value').val(seconds / 3600);
+        $('#timer-unit').val('3600');
+    } else if (seconds % 60 === 0) {
+        $('#timer-value').val(seconds / 60);
+        $('#timer-unit').val('60');
+    } else {
+        $('#timer-value').val(seconds);
+        $('#timer-unit').val('1');
     }
 }
 
+function generateID() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    let id = '';
+    for (let index = 0; index < 8; index++) {
+        id += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return id;
+}
+
+function archiveScheduleFromDays(days) {
+    if (days === 1) return 'daily';
+    if (days === 7) return 'weekly';
+    return 'monthly';
+}
+
+function estimateImagesPerDay(timerSeconds) {
+    if (!timerSeconds) return 1;
+    return Math.max(1, Math.round(86400 / timerSeconds));
+}
+
+function updateArchiveGuide() {
+    const isTimer = $('#triggerType-timer').is(':checked');
+    if (isTimer) {
+        const timerValue = parseInt($('#timer-value').val(), 10);
+        const timerUnit = parseInt($('#timer-unit').val(), 10);
+        if (timerValue > 0 && timerUnit > 0) {
+            $('#expected-images-per-day').val(estimateImagesPerDay(timerValue * timerUnit));
+        }
+    }
+
+    const schedule = $('#archive-schedule').val();
+    if (schedule === 'none') {
+        $('#expected-images-per-day').prop('disabled', true);
+        $('#archive-guide').text('Archives disabled for this recording.');
+        return;
+    }
+
+    $('#expected-images-per-day').prop('disabled', false);
+    const multiplier = schedule === 'daily' ? 1 : (schedule === 'weekly' ? 7 : 31);
+    const imagesPerDay = parseInt($('#expected-images-per-day').val(), 10) || 1;
+    const imagesPerArchive = multiplier * imagesPerDay;
+    $('#archive-guide').text(imagesPerArchive.toLocaleString() + ' expected images per archive at ' + imagesPerDay.toLocaleString() + ' images/day.');
+}
+
+function formatFileSize(bytes) {
+    if (!bytes) return '0 KB';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
 </script>
 </body>
 </html>

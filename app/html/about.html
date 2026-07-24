@@ -4,160 +4,194 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Timelapse</title>
-    <link rel="stylesheet" href="css/bootstrap.min.css">
-    <link rel="stylesheet" href="css/app.css">
-    <script src="js/jquery-3.7.1.min.js"></script>
-    <script src="js/bootstrap.bundle.min.js"></script>
+    <link rel="stylesheet" href="css/bootstrap.min.css?v=3.0.0">
+    <link rel="stylesheet" href="css/app.css?v=3.0.0">
+    <script src="js/jquery-3.7.1.min.js?v=3.0.0"></script>
+    <script src="js/bootstrap.bundle.min.js?v=3.0.0"></script>
 </head>
-
 <body>
-<div class="d-flex" id="wrapper">
-	<div class="bg-light border-right" id="sidebar-wrapper">
-	<div class="sidebar-heading">&nbsp;Timelapse&nbsp;</div>
-		<div class="list-group list-group-flush">
-		<a href="index.html" class="list-group-item list-group-item-action">Recordings</a>
-		<a href="timelapse.html" class="list-group-item list-group-item-action">Settings</a>
-		<a href="sunevents.html" class="list-group-item list-group-item-action">Location</a>
-		<a href="archive.html" class="list-group-item list-group-item-action">Archive</a>
-		<a href="about.html" class="list-group-item list-group-item-action active">About</a>
-		</div>
-	</div>
+<div class="tl-app">
+    <aside class="tl-sidebar">
+        <div class="tl-brand"><span class="tl-brand-text">Timelapse</span></div>
+        <nav class="tl-nav" aria-label="Primary navigation">
+            <a href="index.html" class="tl-nav-link">Recordings</a>
+            <a href="sunevents.html" class="tl-nav-link">Settings</a>
+            <a href="about.html" class="tl-nav-link active">About</a>
+        </nav>
+    </aside>
 
-	<div id="page-content-wrapper">
-		<div class="container">
-			<div class="row">
-				<div class="col-12">
-					<br>
-					<h2>Application</h2>
-					<div class="info-grid">
-						<div class="info-row">
-							<div class="info-label">Name:</div>
-							<div class="info-value"><span id="name"></span></div>
-						</div>
-						<div class="info-row">
-							<div class="info-label">Package:</div>
-							<div class="info-value"><span id="package"></span></div>
-						</div>
-						<div class="info-row">
-							<div class="info-label">Version:</div>
-							<div class="info-value"><span id="version"></span></div>
-						</div>
-						<div class="info-row">
-							<div class="info-label">Vendor:</div>
-							<div class="info-value"><span id="vendor"></span></div>
-						</div>
-						<div class="info-row">
-							<div class="info-label">URL:</div>
-							<div class="info-value">
-								<a id="vendorLink" href="" target="_blank"><span id="url"></span></a>
-							</div>
-						</div>
-						<div class="info-row">
-							<div class="info-label">Device:</div>
-							<div class="info-value"><span id="model"></span></div>
-						</div>
-						<div class="info-row">
-							<div class="info-label">Firmware:</div>
-							<div class="info-value"><span id="firmware"></span></div>
-						</div>
-						<div class="info-row">
-							<div class="info-label">Serial:</div>
-							<div class="info-value"><span id="serial"></span></div>
-						</div>
-						<div class="info-row">
-							<div class="info-label">Chip:</div>
-							<div class="info-value"><span id="chip"></span></div>
-						</div>
-						<div class="info-row">
-							<div class="info-label">Architecture:</div>
-							<div class="info-value"><span id="arch"></span></div>
-						</div>
-					</div>
-				<br>
-				<h2>Support</h2>
-				<div class="card" style="max-width:420px;">
-					<div class="card-body">
-						<p class="text-muted mb-3">If you find this application useful, please consider supporting its development.</p>
-						<a href="https://buymeacoffee.com/fredjuhlinl" target="_blank" class="d-inline-flex align-items-center gap-2 text-decoration-none" style="background:#FFDD00;color:#000;padding:8px 16px;border-radius:8px;font-weight:600;font-size:.9rem;transition:opacity .2s" onmouseover="this.style.opacity='0.85'" onmouseout="this.style.opacity='1'">
-							<img src="https://cdn.buymeacoffee.com/buttons/bmc-new-btn-logo.svg" alt="" width="20" height="28" style="vertical-align:middle">
-							Buy me a coffee
-						</a>
-					</div>
-				</div>
-				</div>
-			</div>
-		</div>
-	</div>
-	<div class="modal fade" id="errorModal" tabindex="-1" aria-labelledby="errorModalLabel" aria-hidden="true">
-		<div class="modal-dialog">
-			<div class="modal-content">
-				<div class="modal-header">
-					<h5 class="modal-title" id="errorModalLabel">Error</h5>
-					<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-				</div>
-				<div class="modal-body">
-					The application is not running.
-				</div>
-				<div class="modal-footer">
-					<button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-				</div>
-			</div>
-		</div>
-	</div>				
+    <main class="tl-main">
+        <div class="container-fluid">
+            <header class="tl-topbar">
+                <div>
+                    <h1 class="tl-page-title">About</h1>
+                </div>
+            </header>
+
+            <div class="tl-grid two">
+                <section class="tl-panel">
+                    <div class="tl-panel-header">
+                        <div>
+                            <h2 class="tl-panel-title">Application</h2>
+                            <p class="tl-panel-subtitle">Package metadata reported by Timelapse.</p>
+                        </div>
+                    </div>
+                    <div class="tl-panel-body">
+                        <div class="info-grid">
+                            <div class="info-row"><div class="info-label">Name</div><div class="info-value" id="name">--</div></div>
+                            <div class="info-row"><div class="info-label">Package</div><div class="info-value" id="package">--</div></div>
+                            <div class="info-row"><div class="info-label">Version</div><div class="info-value" id="version">--</div></div>
+                            <div class="info-row"><div class="info-label">Vendor</div><div class="info-value" id="vendor">--</div></div>
+                            <div class="info-row"><div class="info-label">URL</div><div class="info-value"><a id="vendorLink" href="#" target="_blank" rel="noreferrer"><span id="url">--</span></a></div></div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="tl-panel">
+                    <div class="tl-panel-header">
+                        <div>
+                            <h2 class="tl-panel-title">Camera</h2>
+                            <p class="tl-panel-subtitle">Device properties from Axis basic device info.</p>
+                        </div>
+                    </div>
+                    <div class="tl-panel-body">
+                        <div class="info-grid">
+                            <div class="info-row"><div class="info-label">Device</div><div class="info-value" id="model">--</div></div>
+                            <div class="info-row"><div class="info-label">Firmware</div><div class="info-value" id="firmware">--</div></div>
+                            <div class="info-row"><div class="info-label">Serial</div><div class="info-value" id="serial">--</div></div>
+                            <div class="info-row"><div class="info-label">Chip</div><div class="info-value" id="chip">--</div></div>
+                            <div class="info-row"><div class="info-label">Architecture</div><div class="info-value" id="arch">--</div></div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="tl-panel">
+                    <div class="tl-panel-header">
+                        <div>
+                            <h2 class="tl-panel-title">Storage utilization</h2>
+                        </div>
+                    </div>
+                    <div class="tl-panel-body">
+                        <div class="tl-storage-meter" aria-label="Storage used">
+                            <div class="tl-storage-meter-bar" id="storage-used-bar"></div>
+                        </div>
+                        <div class="info-grid mt-3">
+                            <div class="info-row"><div class="info-label">Used</div><div class="info-value" id="storage-used">--</div></div>
+                            <div class="info-row"><div class="info-label">Free</div><div class="info-value" id="storage-free">--</div></div>
+                            <div class="info-row"><div class="info-label">Total</div><div class="info-value" id="storage-total">--</div></div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <section class="tl-panel mt-3">
+                <div class="tl-panel-header">
+                    <div>
+                        <h2 class="tl-panel-title">Support</h2>
+                        <p class="tl-panel-subtitle">Project and development support.</p>
+                    </div>
+                    <a href="https://buymeacoffee.com/fredjuhlinl" target="_blank" rel="noreferrer" class="btn btn-bmc"><img src="https://cdn.buymeacoffee.com/buttons/bmc-new-btn-logo.svg" alt="" aria-hidden="true">Buy Me a Coffee</a>
+                </div>
+            </section>
+        </div>
+    </main>
+</div>
+
+<div class="modal fade" id="errorModal" tabindex="-1" aria-labelledby="errorModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="errorModalLabel">Application unavailable</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">The Timelapse service did not respond.</div>
+        </div>
+    </div>
 </div>
 
 <script>
+function showModal(id) {
+    bootstrap.Modal.getOrCreateInstance(document.getElementById(id)).show();
+}
+
+function setBrandName(name) {
+    document.title = name;
+    $('.tl-brand-text').text(name);
+}
 
 $(document).ready(function() {
+    $.ajax({
+        type: 'GET',
+        url: 'app',
+        dataType: 'json',
+        cache: false,
+        success: function(app) {
+            const setup = app.manifest.acapPackageConf.setup;
+            setBrandName(setup.friendlyName);
+            $('#name').text(setup.friendlyName);
+            $('#package').text(setup.appName);
+            $('#version').text(setup.version);
+            $('#vendor').text(setup.vendor);
+            $('#url').text(setup.vendorUrl);
+            $('#vendorLink').attr('href', setup.vendorUrl);
+        },
+        error: function() { showModal('errorModal'); }
+    });
 
-	$.ajax({
-		type: "GET",
-		url: 'app',
-		dataType: 'json',
-		cache: false,
-		success: function(app) {
-            document.title = app.manifest.acapPackageConf.setup.friendlyName;
-            $('.sidebar-heading').text(app.manifest.acapPackageConf.setup.friendlyName);
-			$('#name').text(app.manifest.acapPackageConf.setup.friendlyName);
-			$('#package').text(app.manifest.acapPackageConf.setup.appName);
-			$('#version').text(app.manifest.acapPackageConf.setup.version);
-			$('#vendor').text(app.manifest.acapPackageConf.setup.vendor);
-			$('#url').text(app.manifest.acapPackageConf.setup.vendorUrl);
-			$("#vendorLink").attr("href",app.manifest.acapPackageConf.setup.vendorUrl);
-		},
-		error: function(response) {
-			$('#errorModal').modal('show');
-		}
-	});
+    $.ajax({
+        type: 'POST',
+        url: '/axis-cgi/basicdeviceinfo.cgi',
+        data: '{"apiVersion":"1.0","context":"acap","method":"getAllProperties"}',
+        contentType: 'application/json',
+        dataType: 'json',
+        cache: false,
+        success: function(basicdeviceinfo) {
+            const properties = basicdeviceinfo.data.propertyList;
+            $('#model').text(properties.ProdShortName);
+            $('#firmware').text(properties.Version);
+            $('#serial').text(properties.SerialNumber);
+            $('#chip').text(properties.Soc);
+            $('#arch').text(properties.Architecture);
+        },
+        error: function(response) { alert(response.statusText); }
+    });
 
-	$.ajax({
-		type: "POST",
-		url: '/axis-cgi/basicdeviceinfo.cgi',
-		data:'{"apiVersion": "1.0","context": "acap","method": "getAllProperties"}',
-		contentType: 'application/json',
-		dataType: 'json',
-		cache: false,
-		success: function(basicdeviceinfo) {
-			$('#model').text(basicdeviceinfo.data.propertyList.ProdShortName);
-			$('#firmware').text(basicdeviceinfo.data.propertyList.Version);
-			$('#serial').text(basicdeviceinfo.data.propertyList.SerialNumber);
-			$('#chip').text(basicdeviceinfo.data.propertyList.Soc);
-			$('#arch').text(basicdeviceinfo.data.propertyList.Architecture);
-		},
-		error: function(response) {
-			alert(response.statusText);
-		}
-	});
+    $.ajax({
+        type: 'GET',
+        url: 'status',
+        dataType: 'json',
+        cache: false,
+        success: function(status) {
+            const sdcard = status && status.sdcard ? status.sdcard : {};
+            updateStorageUtilization(sdcard);
+        },
+        error: function() { updateStorageUtilization({}); }
+    });
+});
 
-	// Menu toggle handler
-	$("#menu-toggle").click(function(e) {
-		e.preventDefault();
-		$("#wrapper").toggleClass("toggled");
-	});
+function updateStorageUtilization(sdcard) {
+    const total = Number(sdcard.totalBytes || 0);
+    const used = Number(sdcard.usedBytes || 0);
+    const free = Number(sdcard.freeBytes || 0);
+    const percent = Math.min(100, Math.max(0, Number(sdcard.usedPercent || 0)));
 
+    $('#storage-used').text(total > 0 ? formatFileSize(used) + ' (' + percent.toFixed(1) + '%)' : '--');
+    $('#storage-free').text(total > 0 ? formatFileSize(free) : '--');
+    $('#storage-total').text(total > 0 ? formatFileSize(total) : '--');
+    $('#storage-used-bar').css('width', percent + '%');
+}
 
-});	
+function formatFileSize(bytes) {
+    if (!bytes || bytes <= 0) return '0 KB';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = bytes;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+        size /= 1024;
+        unit++;
+    }
+    return size.toFixed(size >= 10 || unit === 0 ? 0 : 1) + ' ' + units[unit];
+}
 </script>
 </body>
-
 </html>

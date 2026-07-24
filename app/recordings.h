@@ -6,8 +6,9 @@
 int		Recordings_Init(void);
 int		Recordings_Capture(cJSON* profile);
 int		Recordings_Clear(const char* profileId);
+int		Recordings_Delete_Profile_Media(const char* profileId);
 cJSON*	Recordings_Get_List(void);
-cJSON* 	Recordings_Get_Metadata(const char* profileId);
+cJSON*	Recordings_Get_Metadata(const char* profileId);
 void	Recordings_Reset();
 
 #endif

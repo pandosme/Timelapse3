@@ -1,8 +1,8 @@
 PROG1	= timelapse2
-OBJS1	= main.c ACAP.c cJSON.c timelapse.c sunevents.c recordings.c
+OBJS1	= main.c ACAP.c cJSON.c storage.c capture.c recording_store.c media.c migration.c timelapse.c sunevents.c recordings.c
 PROGS	= $(PROG1)
 
-PKGS = glib-2.0 gio-2.0 vdostream axevent fcgi libcurl 
+PKGS = glib-2.0 gio-2.0 vdostream axevent fcgi libcurl
 
 CFLAGS += -Wno-format-truncation -Wno-format-overflow
 CFLAGS += $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags $(PKGS))

@@ -4,9 +4,11 @@
 #include <syslog.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include <glib.h>
 #include <glib-unix.h>
 #include <signal.h>
+#include <unistd.h>
 
 #include "vdo-stream.h"
 #include "vdo-frame.h"
@@ -15,7 +17,10 @@
 #include "cJSON.h"
 #include "timelapse.h"
 #include "recordings.h"
+#include "migration.h"
 #include "sunevents.h"
+#include "storage.h"
+#include <sys/statvfs.h>
 
 #define APP_PACKAGE "timelapse2"
 
@@ -33,7 +38,7 @@ void MAIN_Timelapse_Trigger(cJSON* profile) {
 
 	// Check if profile has conditions
 	const char* conditions = cJSON_GetStringValue(cJSON_GetObjectItem(profile, "conditions"));
-	LOG_TRACE("%s: D2D= %d S2S= %d Conditions= %s\n", 
+	LOG_TRACE("%s: D2D= %d S2S= %d Conditions= %s\n",
               __func__, SunEvents_Between_Dawn_Dusk(), SunEvents_Between_Sunrise_Sunset(), conditions ? conditions : "None");
 
 	if (conditions) {
@@ -60,52 +65,16 @@ void Settings_Updated_Callback(const char* service, cJSON* data) {
 }
 
 static void
-HTTP_Endpoint_Reset(const ACAP_HTTP_Response response, 
+HTTP_Endpoint_Reset(const ACAP_HTTP_Response response,
                               const ACAP_HTTP_Request request) {
-    const char* base_path = "/var/spool/storage/SD_DISK/timelapse2";
-    DIR* dir = opendir(base_path);
-    if (!dir) {
-        LOG_WARN("%s: Cannot open directory %s\n", __func__, base_path);
-        ACAP_HTTP_Respond_Text(response, "OK");
-    }
-
 	LOG("Resetting everything\n");
 
-    struct dirent* entry;
-    while ((entry = readdir(dir))) {
-        if (strcmp(entry->d_name, ".") == 0 || 
-            strcmp(entry->d_name, "..") == 0)
-            continue;
-
-        char path[256];
-        snprintf(path, sizeof(path), "%s/%s", base_path, entry->d_name);
-
-        struct stat st;
-        if (stat(path, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
-                // Delete directory contents first
-                DIR* subdir = opendir(path);
-                if (subdir) {
-                    struct dirent* subentry;
-                    while ((subentry = readdir(subdir))) {
-                        if (strcmp(subentry->d_name, ".") == 0 || 
-                            strcmp(subentry->d_name, "..") == 0)
-                            continue;
-
-                        char subpath[256];
-                        snprintf(subpath, sizeof(subpath), "%s/%s", 
-                                path, subentry->d_name);
-                        unlink(subpath);
-                    }
-                    closedir(subdir);
-                }
-                rmdir(path);
-            } else {
-                unlink(path);
-            }
-        }
+    char error_message[256];
+    if (!storage_reset(error_message, sizeof(error_message))) {
+        LOG_WARN("%s: %s\n", __func__, error_message);
+        ACAP_HTTP_Respond_Error(response, 500, error_message);
+        return;
     }
-    closedir(dir);
 
 	Timelapse_Reset();
 	Recordings_Reset();
@@ -114,6 +83,29 @@ HTTP_Endpoint_Reset(const ACAP_HTTP_Response response,
 }
 
 static GMainLoop *main_loop = NULL;
+static int services_started = 0;
+
+static gboolean update_storage_status(gpointer user_data);
+
+static void start_services(void) {
+	if (services_started) {
+		return;
+	}
+
+	LOG("Timelapse settings OK\n");
+	Timelapse_Init(MAIN_Timelapse_Trigger);
+	LOG("Timelapse recording OK\n");
+	Recordings_Init();
+	LOG("Sun events OK\n");
+	SunEvents_Init();
+	services_started = 1;
+	ACAP_STATUS_SetString("app", "status", "Timelapse is running");
+}
+
+static void migration_complete(void) {
+	LOG("Migration complete; starting services\n");
+	start_services();
+}
 
 static gboolean
 signal_handler(gpointer user_data) {
@@ -124,69 +116,54 @@ signal_handler(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
+static gboolean update_storage_status(gpointer user_data) {
+	struct statvfs storage;
+	if (statvfs(storage_root(), &storage) == 0 && storage.f_frsize > 0) {
+		unsigned long long total = (unsigned long long)storage.f_blocks * storage.f_frsize;
+		unsigned long long free_bytes = (unsigned long long)storage.f_bavail * storage.f_frsize;
+		unsigned long long used = total > free_bytes ? total - free_bytes : 0;
+		double used_percent = total > 0 ? ((double)used * 100.0) / (double)total : 0.0;
+
+		ACAP_STATUS_SetNumber("sdcard", "totalBytes", (double)total);
+		ACAP_STATUS_SetNumber("sdcard", "usedBytes", (double)used);
+		ACAP_STATUS_SetNumber("sdcard", "freeBytes", (double)free_bytes);
+		ACAP_STATUS_SetNumber("sdcard", "usedPercent", used_percent);
+	}
+	return G_SOURCE_CONTINUE;
+}
+
 static gboolean delayed_Init(gpointer user_data) {
-    const char* timelapse_dir = "/var/spool/storage/SD_DISK/timelapse2";
-    struct stat st;
-    int dir_ok = 0;  // Track overall directory status
+	int dir_ok = 0;
+	char error_message[256];
 	LOG("SD Card will be initializing\n");
 
 	LOG("Check SD Card\n");
-    // 1. Check directory existence
-    if (stat(timelapse_dir, &st) == -1) {
-        if (errno == ENOENT) {
-            // Directory doesn't exist - attempt creation
-            LOG("Creating directory: %s", timelapse_dir);
-            if (mkdir(timelapse_dir, 0755) == -1) {
-				char error_message[256];
-				sprintf(error_message, "Creation failed: %s (%s)", timelapse_dir, strerror(errno) );
-                LOG_WARN("%s",error_message);
-				ACAP_STATUS_SetBool("sdcard","present",0);
-				ACAP_STATUS_SetString("sdcard","message",error_message);
-            } else {
-                LOG("Directory created successfully");
-                dir_ok = 1;  // Tentatively mark OK until access check
-				ACAP_STATUS_SetBool("sdcard","present",1);
-				ACAP_STATUS_SetString("sdcard","message","");
-            }
-        } else {
-            LOG_WARN("Directory check failed: %s (%s)", timelapse_dir, strerror(errno));
-        }
-    } else {
-        dir_ok = 1;  // Exists, check access next
+	dir_ok = storage_ensure_root(error_message, sizeof(error_message));
+	if (dir_ok) {
+		LOG("Directory verified: %s", storage_root());
 		ACAP_STATUS_SetBool("sdcard","present",1);
 		ACAP_STATUS_SetString("sdcard","message","");
-    }
-
-    // 2. Verify directory accessibility
-    if (dir_ok) {
-        if (access(timelapse_dir, R_OK | W_OK | X_OK) == -1) {
-			char error_message[256];
-			sprintf(error_message, "Directory inaccessible: %s (%s)", timelapse_dir, strerror(errno) );
-            LOG_WARN("%s",error_message);
-			ACAP_STATUS_SetBool("sdcard","present",0);
-			ACAP_STATUS_SetString("sdcard","message",error_message);
-            dir_ok = 0;
-        } else {
-            LOG("Directory verified: %s", timelapse_dir);
-			ACAP_STATUS_SetBool("sdcard","present",1);
-			ACAP_STATUS_SetString("sdcard","message","");
-        }
-    }
+	} else {
+		LOG_WARN("%s", error_message);
+		ACAP_STATUS_SetBool("sdcard","present",0);
+		ACAP_STATUS_SetString("sdcard","message",error_message);
+	}
 
     // 3. Update status and handle services
     if (dir_ok) {
-        LOG("Timelapse settings OK\n");
-        Timelapse_Init(MAIN_Timelapse_Trigger);
-        LOG("Timelapse recording OK\n");
-        Recordings_Init();
-        LOG("Sun events OK\n");
-        SunEvents_Init();
+		update_storage_status(NULL);
+		Migration_Init(migration_complete);
+		if (Migration_Is_Pending()) {
+			LOG("Legacy migration pending; recording services paused\n");
+			ACAP_STATUS_SetString("app", "status", "Waiting for AVI migration decision");
+		} else {
+			start_services();
+		}
     } else {
         LOG_WARN("Cannot initialize services - directory unavailable");
     }
 
     LOG("SD Card OK\n");
-
     return G_SOURCE_REMOVE;
 }
 
@@ -202,10 +179,11 @@ int main(void) {
     ACAP_HTTP_Node("reset", HTTP_Endpoint_Reset);
 
 	LOG("SD Card will be initialized in 10 seconds\n");
+		g_timeout_add_seconds(30, update_storage_status, NULL);
 	ACAP_STATUS_SetBool("sdcard","present",0);
 	ACAP_STATUS_SetString("sdcard","message","Intializaing SD Card");
 	g_timeout_add_seconds(6, delayed_Init, NULL);
-	
+
     // Create and run the main loop
 	main_loop = g_main_loop_new(NULL, FALSE);
 	GMainContext *context = g_main_loop_get_context(main_loop);
@@ -219,7 +197,7 @@ int main(void) {
 	} else {
 		LOG_WARN("Signal detection failed");
 	}
-	
+
     g_main_loop_run(main_loop);
 	LOG("------ Exit %s ------\n",APP_PACKAGE);
     ACAP_Cleanup();

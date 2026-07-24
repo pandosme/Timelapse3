@@ -4,260 +4,306 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Timelapse</title>
-    
-    <link rel="stylesheet" href="css/bootstrap.min.css">
-	<link href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" rel="stylesheet">
-    <link rel="stylesheet" href="css/app.css">
-    <script src="js/jquery-3.7.1.min.js"></script>
-    <script src="js/bootstrap.bundle.min.js"></script>
+    <link rel="stylesheet" href="css/bootstrap.min.css?v=3.0.0">
+    <link href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" rel="stylesheet">
+    <link rel="stylesheet" href="css/app.css?v=3.0.0">
+    <script src="js/jquery-3.7.1.min.js?v=3.0.0"></script>
+    <script src="js/bootstrap.bundle.min.js?v=3.0.0"></script>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
-<div class="d-flex" id="wrapper">
-    <div class="bg-light border-right" id="sidebar-wrapper">
-        <div class="sidebar-heading">&nbsp;Timelapse&nbsp;</div>
-        <div class="list-group list-group-flush">
-            <a href="index.html" class="list-group-item list-group-item-action">Recordings</a>
-            <a href="timelapse.html" class="list-group-item list-group-item-action">Settings</a>
-            <a href="sunevents.html" class="list-group-item list-group-item-action active">Location</a>
-            <a href="archive.html" class="list-group-item list-group-item-action">Archive</a>
-            <a href="about.html" class="list-group-item list-group-item-action">About</a>
-        </div>
-    </div>
+<div class="tl-app">
+    <aside class="tl-sidebar">
+        <div class="tl-brand"><span class="tl-brand-text">Timelapse</span></div>
+        <nav class="tl-nav" aria-label="Primary navigation">
+            <a href="index.html" class="tl-nav-link">Recordings</a>
+            <a href="sunevents.html" class="tl-nav-link active">Settings</a>
+            <a href="about.html" class="tl-nav-link">About</a>
+        </nav>
+    </aside>
 
-    <div id="page-content-wrapper">
-        <div class="container-fluid mt-4">
-            <div class="row">
-                <div class="col-md-8">
-                    <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0">Camera Location</h5>
+    <main class="tl-main">
+        <div class="container-fluid">
+            <header class="tl-topbar">
+                <div>
+                    <h1 class="tl-page-title">Settings</h1>
+                </div>
+            </header>
+
+            <section class="tl-panel tl-settings-card" id="migrationStatusCard" style="display:none;">
+                <div class="tl-panel-header">
+                    <div>
+                        <h2 class="tl-panel-title">Compatibility</h2>
+                    </div>
+                </div>
+                <div class="tl-panel-body">
+                    <div class="info-grid">
+                        <div class="info-row"><div class="info-label">AVI migration</div><div class="info-value" id="migrationStatus">--</div></div>
+                        <div class="info-row"><div class="info-label">Progress</div><div class="info-value" id="migrationProgress">--</div></div>
+                        <div class="info-row"><div class="info-label">Current file</div><div class="info-value" id="migrationCurrent">--</div></div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="tl-panel tl-settings-card">
+                <div class="tl-panel-header">
+                    <div>
+                        <h2 class="tl-panel-title">Archive retention</h2>
+                    </div>
+                </div>
+                <div class="tl-panel-body">
+                    <label for="retentionMonths" class="form-label fw-bold">Remove archives older than</label>
+                    <select id="retentionMonths" class="form-select form-select-lg tl-setting-select">
+                        <option value="1">1 month</option>
+                        <option value="3">3 months</option>
+                        <option value="6">6 months</option>
+                        <option value="9">9 months</option>
+                        <option value="12">12 months</option>
+                    </select>
+                </div>
+            </section>
+
+            <section class="tl-panel tl-settings-card">
+                <div class="tl-panel-header">
+                    <div>
+                        <h2 class="tl-panel-title">Sun & Location</h2>
+                    </div>
+                </div>
+                <div class="tl-panel-body">
+                    <section class="tl-metrics" aria-label="Sun event summary">
+                        <div class="tl-metric">
+                            <p class="tl-metric-label">Dawn</p>
+                            <span class="tl-metric-value" id="dawn-time">--:--</span>
+                            <span class="tl-metric-note">Civil dawn</span>
                         </div>
-                        <div class="card-body">
-							<div id="map-container">
-								<div id="map" style="height: 400px;"></div>
-								<div id="map-error" style="display: none; text-align: center; padding: 20px; background-color: #f8d7da; color: #721c24;">
-									<p>Map is not available. Please manually enter the location below:</p>
-									<form id="manual-location-form">
-										<label for="manual-lat">Latitude:</label>
-										<input type="number" id="manual-lat" step="0.000001" required>
-										<label for="manual-lon">Longitude:</label>
-										<input type="number" id="manual-lon" step="0.000001" required>
-										<button type="submit">Submit</button>
-									</form>
-								</div>
-							</div>
-                            <div class="mt-3">
-                                <span class="fw-bold">Latitude: </span><span id="lat">0</span>
-                                <span class="fw-bold ms-3">Longitude: </span><span id="lon">0</span>
+                        <div class="tl-metric">
+                            <p class="tl-metric-label">Sunrise</p>
+                            <span class="tl-metric-value" id="sunrise-time">--:--</span>
+                            <span class="tl-metric-note">Sun appears</span>
+                        </div>
+                        <div class="tl-metric">
+                            <p class="tl-metric-label">Sunset</p>
+                            <span class="tl-metric-value" id="sunset-time">--:--</span>
+                            <span class="tl-metric-note">Sun disappears</span>
+                        </div>
+                        <div class="tl-metric">
+                            <p class="tl-metric-label">Dusk</p>
+                            <span class="tl-metric-value" id="dusk-time">--:--</span>
+                            <span class="tl-metric-note">Civil dusk</span>
+                        </div>
+                    </section>
+
+                    <div class="tl-grid two">
+                        <section class="tl-settings-region">
+                            <div class="tl-section-heading">
+                                <h3>Camera position</h3>
                             </div>
-                        </div>
+                            <div id="map"></div>
+                            <div id="map-error" class="tl-empty" style="display:none;">
+                                <strong>Map unavailable</strong>Use the coordinate fields to save the camera location.
+                            </div>
+                        </section>
+
+                        <aside class="tl-settings-region">
+                            <div class="tl-section-heading">
+                                <h3>Coordinates</h3>
+                            </div>
+                            <form id="manual-location-form" class="tl-grid">
+                                <div>
+                                    <label for="manual-lat" class="form-label fw-bold">Latitude</label>
+                                    <input type="number" id="manual-lat" class="form-control form-control-lg" step="0.000001" required>
+                                </div>
+                                <div>
+                                    <label for="manual-lon" class="form-label fw-bold">Longitude</label>
+                                    <input type="number" id="manual-lon" class="form-control form-control-lg" step="0.000001" required>
+                                </div>
+                                <button type="submit" class="btn btn-primary">Save location</button>
+                            </form>
+                            <div class="mt-3">
+                                <span class="tl-badge muted">Lat <span id="lat" class="ms-1">0</span></span>
+                                <span class="tl-badge muted ms-2">Lon <span id="lon" class="ms-1">0</span></span>
+                            </div>
+                            <div class="info-grid mt-3">
+                                <div class="info-row"><div class="info-label">Sun noon</div><div class="info-value" id="sunnoon-time">--:--</div></div>
+                            </div>
+                        </aside>
                     </div>
                 </div>
-                <div class="col-md-4">
-                    <div class="card">
-                        <div class="card-header">
-                            <h5 class="mb-0">Sun Events</h5>
-                        </div>
-                        <div class="card-body">
-                            <table class="table">
-                                <tbody>
-                                    <tr>
-                                        <td class="fw-bold">Dawn</td>
-                                        <td id="dawn-time">--:--</td>
-                                    </tr>
-                                    <tr>
-                                        <td class="fw-bold">Sunrise</td>
-                                        <td id="sunrise-time">--:--</td>
-                                    </tr>
-                                    <tr>
-                                        <td class="fw-bold">Sun Noon</td>
-                                        <td id="sunnoon-time">--:--</td>
-                                    </tr>
-                                    <tr>
-                                        <td class="fw-bold">Sunset</td>
-                                        <td id="sunset-time">--:--</td>
-                                    </tr>
-                                    <tr>
-                                        <td class="fw-bold">Dusk</td>
-                                        <td id="dusk-time">--:--</td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </div>
+            </section>
+        </div>
+    </main>
+</div>
+
+<div class="modal fade" id="errorModal" tabindex="-1" aria-labelledby="errorModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="errorModalLabel">Application unavailable</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
+            <div class="modal-body">The Timelapse service did not respond.</div>
         </div>
     </div>
-	<div class="modal fade" id="errorModal" tabindex="-1" aria-labelledby="errorModalLabel" aria-hidden="true">
-		<div class="modal-dialog">
-			<div class="modal-content">
-				<div class="modal-header">
-					<h5 class="modal-title" id="errorModalLabel">Error</h5>
-					<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-				</div>
-				<div class="modal-body">
-					The application is not running.
-				</div>
-				<div class="modal-footer">
-					<button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-				</div>
-			</div>
-		</div>
-	</div>				
 </div>
 
 <script>
-$(document).ready(function () {
-    // Function to check if Leaflet is loaded
-    function isLeafletLoaded() {
-        return typeof L !== 'undefined' && typeof L.map === 'function';
-    }
+let map = null;
+let marker = null;
 
-    // Initialize map or show error
-    if (isLeafletLoaded()) {
-        try {
-            const map = L.map('map').setView([51.505, -0.09], 13);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '© OpenStreetMap contributors'
-            }).addTo(map);
+function showModal(id) {
+    bootstrap.Modal.getOrCreateInstance(document.getElementById(id)).show();
+}
 
-            let marker;
+function setBrandName(name) {
+    document.title = name;
+    $('.tl-brand-text').text(name);
+}
 
-            // Add marker functionality
-            map.on('click', function (e) {
-                const lat = e.latlng.lat;
-                const lon = e.latlng.lng;
+$(document).ready(function() {
+    $.ajax({
+        type: 'GET',
+        url: 'app',
+        dataType: 'json',
+        cache: false,
+        success: function(app) {
+            setBrandName(app.manifest.acapPackageConf.setup.friendlyName);
+            $('#retentionMonths').val(app.settings.retentionMonths || 6);
+        },
+        error: function() { showModal('errorModal'); }
+    });
 
-                // Update or create a draggable marker
-                if (marker) {
-                    marker.setLatLng(e.latlng);
-                } else {
-                    marker = L.marker(e.latlng, { draggable: true }).addTo(map);
+    initializeMap();
+    loadSunEvents();
+    loadMigrationStatus();
 
-                    // Update location on dragend
-                    marker.on('dragend', function (event) {
-                        const position = event.target.getLatLng();
-                        updateLocation(position.lat, position.lng);
-                    });
-                }
-
-                // Update location display immediately after click
-                updateLocation(lat, lon);
-            });
-
-            // Load initial data
-            $.ajax({
-                type: 'GET',
-                url: 'sunevents',
-                success: function (data) {
-                    updateSunEvents(data);
-                    if (data.lat && data.lon) {
-                        const pos = [data.lat, data.lon];
-                        map.setView(pos, 13);
-
-                        // Create a draggable marker at the initial position
-                        marker = L.marker(pos, { draggable: true }).addTo(map);
-
-                        // Update location on dragend
-                        marker.on('dragend', function (event) {
-                            const position = event.target.getLatLng();
-                            updateLocation(position.lat, position.lng);
-                        });
-
-                        $('#lat').text(data.lat.toFixed(6));
-                        $('#lon').text(data.lon.toFixed(6));
-                    }
-				},
-				error: function(response) {
-					$('#errorModal').modal('show');
-				}
-            });
-        } catch (error) {
-            console.error("Error initializing map:", error);
-            showMapError();
-        }
-    } else {
-        showMapError();
-    }
-
-    // Handle manual location form submission
-    $('#manual-location-form').on('submit', function (e) {
+    $('#manual-location-form').on('submit', function(e) {
         e.preventDefault();
         const lat = parseFloat($('#manual-lat').val());
         const lon = parseFloat($('#manual-lon').val());
-
-        if (!isNaN(lat) && !isNaN(lon)) {
-            updateLocation(lat, lon);
-
-            // Save location via AJAX
-            $.ajax({
-                type: 'POST',
-                url: 'sunevents',
-                contentType: 'application/json',
-                data: JSON.stringify({ lat, lon }),
-                success: function () {
-                    // Fetch updated sun events
-                    $.ajax({
-                        type: 'GET',
-                        url: 'sunevents',
-                        success: updateSunEvents,
-						error: function(response) {
-							$('#errorModal').modal('show');
-						}
-                    });
-                }
-            });
-        } else {
-            alert("Please enter valid latitude and longitude values.");
+        if (Number.isNaN(lat) || Number.isNaN(lon)) {
+            alert('Enter valid latitude and longitude values.');
+            return;
         }
+        saveLocation(lat, lon);
+        setMapPosition(lat, lon);
     });
 
-    // Show map error message
-    function showMapError() {
-        $('#map').hide();
-        $('#map-error').show();
-    }
-
-    // Update location display and send data to server
-    function updateLocation(lat, lon) {
-        $('#lat').text(lat.toFixed(6));
-        $('#lon').text(lon.toFixed(6));
-
-        // Save location via AJAX
-        $.ajax({
-            type: 'POST',
-            url: 'sunevents',
-            contentType: 'application/json',
-            data: JSON.stringify({ lat, lon }),
-            success: function () {
-                // Fetch updated sun events
-                $.ajax({
-                    type: 'GET',
-                    url: 'sunevents',
-                    success: updateSunEvents
-                });
-            }
-        });
-    }
-
-    // Update sun events display
-    function updateSunEvents(data) {
-        $('#dawn-time').text(formatTime(data.dawn));
-        $('#sunrise-time').text(formatTime(data.sunrise));
-        $('#sunnoon-time').text(formatTime(data.sunnoon));
-        $('#sunset-time').text(formatTime(data.sunset));
-        $('#dusk-time').text(formatTime(data.dusk));
-    }
-
-    // Format timestamp into readable time
-    function formatTime(timestamp) {
-        if (!timestamp) return '--:--';
-        const date = new Date(timestamp * 1000);
-        return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-    }
+    $('#retentionMonths').on('change', function() {
+        updateSetting('retentionMonths', parseInt($(this).val(), 10));
+    });
 });
+
+function loadMigrationStatus() {
+    $.ajax({
+        type: 'GET',
+        url: 'migration',
+        dataType: 'json',
+        cache: false,
+        success: function(state) {
+            if (!state || (!state.required && state.status === 'complete' && Number(state.total || 0) === 0)) {
+                $('#migrationStatusCard').hide();
+                return;
+            }
+
+            const total = Number(state.total || 0);
+            const completed = Number(state.completed || 0);
+            $('#migrationStatus').text(state.status || 'unknown');
+            $('#migrationProgress').text(completed.toLocaleString() + ' of ' + total.toLocaleString() + ' files');
+            $('#migrationCurrent').text(state.current || state.message || '--');
+            $('#migrationStatusCard').show();
+        }
+    });
+}
+
+function updateSetting(settingParam, settingValue) {
+    $.ajax({
+        type: 'POST',
+        url: 'settings',
+        contentType: 'application/json',
+        data: JSON.stringify({ [settingParam]: settingValue }),
+        error: function() { alert('Failed to update ' + settingParam); }
+    });
+}
+
+function initializeMap() {
+    if (typeof L === 'undefined' || typeof L.map !== 'function') {
+        showMapError();
+        return;
+    }
+
+    try {
+        map = L.map('map').setView([51.505, -0.09], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        map.on('click', function(e) {
+            saveLocation(e.latlng.lat, e.latlng.lng);
+            setMapPosition(e.latlng.lat, e.latlng.lng);
+        });
+    } catch (error) {
+        console.error('Error initializing map:', error);
+        showMapError();
+    }
+}
+
+function loadSunEvents() {
+    $.ajax({
+        type: 'GET',
+        url: 'sunevents',
+        cache: false,
+        success: function(data) {
+            updateSunEvents(data);
+            if (data.lat && data.lon) {
+                setMapPosition(data.lat, data.lon);
+            }
+        },
+        error: function() { showModal('errorModal'); }
+    });
+}
+
+function saveLocation(lat, lon) {
+    updateLocationDisplay(lat, lon);
+
+    $.ajax({
+        type: 'POST',
+        url: 'sunevents',
+        contentType: 'application/json',
+        data: JSON.stringify({ lat: lat, lon: lon }),
+        success: loadSunEvents,
+        error: function() { alert('Failed to save location'); }
+    });
+}
+
+function setMapPosition(lat, lon) {
+    updateLocationDisplay(lat, lon);
+    if (!map) return;
+
+    const position = [lat, lon];
+    map.setView(position, 13);
+    if (marker) {
+        marker.setLatLng(position);
+        return;
+    }
+
+    marker = L.marker(position, { draggable: true }).addTo(map);
+    marker.on('dragend', function(event) {
+        const dragged = event.target.getLatLng();
+        saveLocation(dragged.lat, dragged.lng);
+    });
+}
+
+function updateLocationDisplay(lat, lon) {
+    $('#lat').text(lat.toFixed(6));
+    $('#lon').text(lon.toFixed(6));
+    $('#manual-lat').val(lat.toFixed(6));
+    $('#manual-lon').val(lon.toFixed(6));
+}
+
+function showMapError() {
+    $('#map').hide();
+    $('#map-error').show();
+}
 
 function updateSunEvents(data) {
     $('#dawn-time').text(formatTime(data.dawn));
@@ -270,13 +316,8 @@ function updateSunEvents(data) {
 function formatTime(timestamp) {
     if (!timestamp) return '--:--';
     const date = new Date(timestamp * 1000);
-    return date.toLocaleTimeString('en-US', { 
-        hour: '2-digit', 
-        minute: '2-digit',
-        hour12: false 
-    });
+    return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 </script>
-
 </body>
 </html>

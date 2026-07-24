@@ -8,12 +8,12 @@
             "vendorId": "6d8351dbbe",
             "vendorUrl": "https://pandosme.github.io",
             "runMode": "respawn",
-            "version": "1.1.3",
+            "version": "3.0.0",
             "compatibleOsVersions": [
                 {
                     "max": "13"
                 }
-            ]            
+            ]
         },
         "configuration": {
 			"settingPage": "index.html",
@@ -23,7 +23,8 @@
 				{"access": "admin","name": "status","type": "fastCgi"},
 				{"access": "admin","name": "timelapse","type": "fastCgi"},
 				{"access": "admin","name": "recordings","type": "fastCgi"},
-				{"access": "admin","name": "image","type": "fastCgi"},
+                {"access": "admin","name": "migration","type": "fastCgi"},
+                {"access": "admin","name": "video","type": "fastCgi"},
 				{"access": "admin","name": "export","type": "fastCgi"},
 				{"access": "admin","name": "sunevents","type": "fastCgi"},
 				{"access": "admin","name": "archive","type": "fastCgi"},
