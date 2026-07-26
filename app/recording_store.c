@@ -55,7 +55,13 @@ static cJSON* load_state(void) {
 }
 
 static int save_state(void) {
+    char error[256];
     char path[1024];
+    if (!storage_ensure_root(error, sizeof(error))) {
+        LOG_WARN("%s: %s\n", __func__, error);
+        return 0;
+    }
+
     if (!storage_recordings_path(path, sizeof(path))) {
         LOG_WARN("%s: Failed to build recordings path\n", __func__);
         return 0;

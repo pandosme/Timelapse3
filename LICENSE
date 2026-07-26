@@ -1,6 +1,109 @@
-MIT License
+Timelapse2
+==========
 
-Copyright (c) 2025 Fred Juhlin <fred.juhlin@gmail.com>
+BSD 3-Clause License
+
+Copyright (c) 2025-2026, Fred Juhlin <fred.juhlin@gmail.com>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+Third-party notices
+===================
+
+Timelapse2 includes or distributes the third-party components listed below.
+Those components remain under their own licenses.
+
+Bundled source code and web assets
+----------------------------------
+
+* cJSON
+  Version: bundled source snapshot
+  License: MIT
+  Copyright (c) 2009-2017 Dave Gamble and cJSON contributors
+  Project: https://github.com/DaveGamble/cJSON
+
+* Bootstrap
+  Version: 5.3.3
+  License: MIT
+  Copyright 2011-2024 The Bootstrap Authors
+  Project: https://getbootstrap.com/
+
+* Popper Core
+  Version: 2.11.8, bundled through Bootstrap
+  License: MIT
+  Copyright (c) 2019 Federico Zivolo and contributors
+  Project: https://github.com/popperjs/popper-core
+
+* bootstrap-select
+  Version: 1.13.18
+  License: MIT
+  Copyright 2012-2020 SnapAppointments, LLC
+  Project: https://developer.snapappointments.com/bootstrap-select/
+
+* jQuery
+  Version: 3.7.1
+  License: MIT
+  Copyright OpenJS Foundation and other contributors
+  Project: https://jquery.com/
+
+* Tom Select
+  Version: 2.2.2
+  License: Apache License, Version 2.0
+  Copyright Josh Schmidt and contributors
+  Project: https://tom-select.js.org/
+
+* media-stream-player
+  Version: 13.3.3
+  License: MIT
+  Copyright Axis Communications AB and contributors
+  Project: https://github.com/AxisCommunications/media-stream-library-js
+
+Bundled binaries
+----------------
+
+* FFmpeg
+  License: GNU General Public License, version 3 or later, for the bundled
+  static binaries used by this project. The bundled binaries include GPL and
+  version-3 enabled FFmpeg components, including libx264.
+  Project: https://ffmpeg.org/
+  Source: https://ffmpeg.org/download.html
+
+External build and runtime dependencies
+---------------------------------------
+
+The ACAP package is built and run against platform or SDK libraries that are not
+distributed as part of this repository, including the Axis ACAP SDK, Axis VDO,
+Axis event libraries, GLib/GIO, libcurl, FastCGI, and systemd libraries. Those
+components are governed by their own licenses from their respective suppliers.
+
+
+MIT license text for MIT-licensed third-party components
+=======================================================
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -20,27 +123,29 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
--------------------------------------------------------------------------------
 
-cJSON - Ultralightweight JSON parser in ANSI C
-MIT License
+Apache License notice for Tom Select
+====================================
 
-Copyright (c) 2009-2017 Dave Gamble and cJSON contributors
+Tom Select is licensed under the Apache License, Version 2.0. You may obtain a
+copy of the license at:
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+https://www.apache.org/licenses/LICENSE-2.0
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Unless required by applicable law or agreed to in writing, software distributed
+under the Apache License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES
+OR CONDITIONS OF ANY KIND, either express or implied. See the Apache License for
+the specific language governing permissions and limitations under the License.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+
+GNU GPL notice for bundled FFmpeg binaries
+=========================================
+
+The bundled FFmpeg binaries are licensed under the GNU General Public License,
+version 3 or later. You may obtain a copy of the GNU General Public License at:
+
+https://www.gnu.org/licenses/gpl-3.0.html
+
+FFmpeg source code is available from:
+
+https://ffmpeg.org/download.html

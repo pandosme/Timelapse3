@@ -8,6 +8,7 @@
 #include <syslog.h>
 #include <stdbool.h>
 #include <time.h>
+#include <ctype.h>
 #include "vdo-stream.h"
 #include "vdo-frame.h"
 #include "vdo-types.h"
@@ -222,6 +223,7 @@ int Recordings_Delete_Archive(const char* filename);
 
 static int stream_file_response(const ACAP_HTTP_Response response, const char* path, const char* content_type, const char* disposition, const char* filename);
 static void normalize_mp4_filename(char* out, size_t out_len, const char* filename);
+static void build_timestamped_export_filename(char* out, size_t out_len, const char* profile_name);
 
 static long long monotonic_ms(void) {
     struct timespec ts;
@@ -701,6 +703,43 @@ static void normalize_mp4_filename(char* out, size_t out_len, const char* filena
     }
 }
 
+static void build_timestamped_export_filename(char* out, size_t out_len, const char* profile_name) {
+    if (!out || out_len == 0) {
+        return;
+    }
+
+    const char* source_name = (profile_name && profile_name[0]) ? profile_name : "timelapse";
+
+    char safe_name[256];
+    size_t src_i = 0;
+    size_t dst_i = 0;
+    while (source_name[src_i] != '\0' && dst_i + 1 < sizeof(safe_name)) {
+        unsigned char ch = (unsigned char)source_name[src_i++];
+        if (isalnum(ch) || ch == '-' || ch == '_') {
+            safe_name[dst_i++] = (char)ch;
+        } else if (ch == ' ' || ch == '.') {
+            safe_name[dst_i++] = '_';
+        }
+    }
+    safe_name[dst_i] = '\0';
+
+    if (safe_name[0] == '\0') {
+        snprintf(safe_name, sizeof(safe_name), "timelapse");
+    }
+
+    time_t now = time(NULL);
+    struct tm local_time;
+    localtime_r(&now, &local_time);
+
+    char date_part[16];
+    char time_part[16];
+    strftime(date_part, sizeof(date_part), "%Y%m%d", &local_time);
+    strftime(time_part, sizeof(time_part), "%H%M%S", &local_time);
+
+    snprintf(out, out_len, "%s-%s-%s.mp4", safe_name, date_part, time_part);
+    normalize_mp4_filename(out, out_len, out);
+}
+
 static int stream_file_response(const ACAP_HTTP_Response response, const char* path, const char* content_type, const char* disposition, const char* filename) {
     long long started_ms = monotonic_ms();
     LOG("%s: start path=%s disposition=%s filename=%s\n", __func__, path ? path : "(null)", disposition ? disposition : "(null)", filename ? filename : "(null)");
@@ -716,9 +755,9 @@ static int stream_file_response(const ACAP_HTTP_Response response, const char* p
     long file_size = ftell(file);
     fseek(file, 0, SEEK_SET);
 
-    ACAP_HTTP_Respond_String(response, "status: 200 OK\r\n");
+    ACAP_HTTP_Respond_String(response, "Status: 200 OK\r\n");
     ACAP_HTTP_Respond_String(response, "Content-Type: %s\r\n", content_type);
-    ACAP_HTTP_Respond_String(response, "Content-Disposition: %s; filename=%s\r\n", disposition, filename);
+    ACAP_HTTP_Respond_String(response, "Content-Disposition: %s; filename=\"%s\"; filename*=UTF-8''%s\r\n", disposition, filename, filename);
     ACAP_HTTP_Respond_String(response, "Content-Length: %ld\r\n", file_size);
     ACAP_HTTP_Respond_String(response, "\r\n");
 
@@ -1039,7 +1078,7 @@ HTTP_Endpoint_Image(const ACAP_HTTP_Response response,
 	fread(buffer, 1, frame_size, framefile);
     fclose(framefile);
 
-    ACAP_HTTP_Respond_String(response, "status: 200 OK\r\n");
+    ACAP_HTTP_Respond_String(response, "Status: 200 OK\r\n");
     ACAP_HTTP_Respond_String(response, "Content-Type: image/jpeg\r\n");
     ACAP_HTTP_Respond_String(response, "Content-Length: %ld\r\n", frame_size);
     ACAP_HTTP_Respond_String(response, "\r\n");
@@ -1102,8 +1141,7 @@ static void HTTP_Endpoint_Export(const ACAP_HTTP_Response response,
     LOG("%s: generated profile=%s fps=%d path=%s elapsed_ms=%lld\n", __func__, profileId, fps, output_path, monotonic_ms() - started_ms);
 
     char download_name[PATH_MAX_LEN];
-    snprintf(download_name, sizeof(download_name), "%s.mp4", profile_name);
-    normalize_mp4_filename(download_name, sizeof(download_name), download_name);
+    build_timestamped_export_filename(download_name, sizeof(download_name), profile_name);
     stream_file_response(response, output_path, "video/mp4", "attachment", download_name);
 }
 

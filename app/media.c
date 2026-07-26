@@ -26,6 +26,8 @@ static int ffmpeg_path_resolved = 0;
 static int ffmpeg_path_logged = 0;
 
 #define REENCODE_EST_MBPS 2.5
+#define INCREMENTAL_RECENT_WINDOW_MS (2LL * 60LL * 60LL * 1000LL)
+#define INCREMENTAL_MIN_PENDING_FRAMES 15
 
 static long long monotonic_ms(void) {
     struct timespec ts;
@@ -84,6 +86,20 @@ static int clamp_fps(int fps) {
     if (fps < 1) return 1;
     if (fps > 60) return 60;
     return fps;
+}
+
+static int should_process_incremental_update(long long last_frame_ms, int pending_frames) {
+    if (pending_frames >= INCREMENTAL_MIN_PENDING_FRAMES) {
+        return 1;
+    }
+
+    if (last_frame_ms <= 0) {
+        return 1;
+    }
+
+    long long now_ms = (long long)time(NULL) * 1000LL;
+    long long age_ms = now_ms - last_frame_ms;
+    return age_ms <= INCREMENTAL_RECENT_WINDOW_MS;
 }
 
 static void set_reencode_status_active(const char* profile_id, int old_fps, int new_fps, long long input_bytes) {
@@ -524,13 +540,19 @@ const char* media_last_error(void) {
 
 static int ensure_cache_dir(const char* profile_id) {
     char error[256];
+    char profiles_dir[1024];
+    char profile_dir[1024];
     char cache_dir[1024];
-    if (!storage_cache_dir(cache_dir, sizeof(cache_dir), profile_id)) {
+    if (!storage_profiles_dir(profiles_dir, sizeof(profiles_dir)) ||
+        !storage_profile_dir(profile_dir, sizeof(profile_dir), profile_id) ||
+        !storage_cache_dir(cache_dir, sizeof(cache_dir), profile_id)) {
         set_last_error("Failed to build cache directory for %s", profile_id);
         return 0;
     }
 
-    if (!storage_ensure_directory(cache_dir, error, sizeof(error))) {
+    if (!storage_ensure_directory(profiles_dir, error, sizeof(error)) ||
+        !storage_ensure_directory(profile_dir, error, sizeof(error)) ||
+        !storage_ensure_directory(cache_dir, error, sizeof(error))) {
         set_last_error("%s", error);
         return 0;
     }
@@ -634,10 +656,6 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
     }
 
     int media_job = kind != MEDIA_ARCHIVE;
-    if (media_job) {
-        const char* stage = kind == MEDIA_PREVIEW ? "Preparing preview video" : "Updating recording video";
-        set_media_encode_status_active(stage, profile_id, fps, frame_count);
-    }
 
     // Frame files can start at a higher index after incremental cleanup.
     char first_frame_path[1024];
@@ -689,6 +707,20 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
         set_last_error("No frame files available for %s", profile_id);
         g_mutex_unlock(&encode_mutex);
         return 0;
+    }
+
+    if (kind != MEDIA_ARCHIVE && finalized_frames > 0 && file_exists_nonempty(output_path) &&
+        !should_process_incremental_update(snapshot.last, frame_count)) {
+        last_error[0] = '\0';
+        LOG("%s: deferred incremental update kind=%s profile=%s pending=%d last_ms=%lld elapsed_ms=%lld\n",
+            __func__, media_kind_name(kind), profile_id, frame_count, snapshot.last, monotonic_ms() - started_ms);
+        g_mutex_unlock(&encode_mutex);
+        return 1;
+    }
+
+    if (media_job) {
+        const char* stage = kind == MEDIA_PREVIEW ? "Preparing preview video" : "Updating recording video";
+        set_media_encode_status_active(stage, profile_id, fps, frame_count);
     }
 
     char frame_count_arg[16];
