@@ -679,6 +679,7 @@ $(document).ready(function() {
         if (action === 'play-archive') playArchive(filename);
         if (action === 'download-archive') downloadArchive(filename);
         if (action === 'archive') archiveRecording(id);
+        if (action === 'refresh') refreshRecording(id);
         if (action === 'reset-live') resetLiveMedia(id);
         if (action === 'delete-live') deleteLiveRecording(id);
         if (action === 'edit') editTimelapse(id);
@@ -792,21 +793,24 @@ function renderRecordings() {
         const menuItems = [];
         if (hasFrames) {
             menuItems.push({ action: 'play', id: id, label: 'Play' });
-            menuItems.push({ action: 'download', id: id, label: 'Export MP4' });
-            if ((profile.archiveSchedule || 'monthly') !== 'none') {
-                menuItems.push({ action: 'archive', id: id, label: 'Archive now' });
-            }
-            menuItems.push({ action: 'reset-live', id: id, label: 'Reset media' });
+            menuItems.push({ action: 'download', id: id, label: 'Download' });
         }
-        menuItems.push({ action: 'edit', id: id, label: 'Edit settings' });
-        menuItems.push({ action: 'delete-live', id: id, label: 'Delete recording' });
+        menuItems.push({ action: 'edit', id: id, label: 'Edit' });
+        if (hasFrames) {
+            menuItems.push({ action: 'refresh', id: id, label: 'Refresh' });
+            if ((profile.archiveSchedule || 'monthly') !== 'none') {
+                menuItems.push({ action: 'archive', id: id, label: 'Archive' });
+            }
+            menuItems.push({ action: 'reset-live', id: id, label: 'Reset' });
+        }
+        menuItems.push({ action: 'delete-live', id: id, label: 'Delete' });
         actions.append(actionMenu(menuItems));
         actionCell.append(actions);
 
         row.append(typeCell)
             .append(profileCell)
             .append($('<td>').text((recording.images || 0).toLocaleString()))
-            .append($('<td>').text(formatFileSize(recording.size)))
+            .append($('<td>').text(formatFileSize(recording.estimatedSize != null ? recording.estimatedSize : recording.size)))
             .append($('<td>').text(formatDate(recording.last)))
             .append($('<td>').text(formatDays(recording.first, Date.now())))
             .append(actionCell);
@@ -825,8 +829,8 @@ function renderRecordings() {
         );
         const actions = $('<div class="tl-actions">').append(actionMenu([
             { action: 'play-archive', filename: filename, label: 'Play' },
-            { action: 'download-archive', filename: filename, label: 'Download MP4' },
-            { action: 'delete-archive', filename: filename, label: 'Delete archive' }
+            { action: 'download-archive', filename: filename, label: 'Download' },
+            { action: 'delete-archive', filename: filename, label: 'Delete' }
         ]));
 
         row.append(typeCell)
@@ -1187,22 +1191,52 @@ function deleteLiveRecording(id) {
     });
 }
 
+function refreshRecording(id) {
+    showBusy('Refreshing recording...');
+    startMediaJobPolling();
+    mediaJobStage = 'Refreshing recording...';
+    mediaJobProgress = 1;
+    renderMediaJobProgress();
+
+    $.ajax({
+        type: 'PUT',
+        url: 'recordings?id=' + encodeURIComponent(id),
+        success: function() {
+            stopMediaJobPolling();
+            hideBusy();
+            loadRecordings();
+            showToast('Recording refreshed.', 'success');
+        },
+        error: function() {
+            stopMediaJobPolling();
+            hideBusy();
+            showToast('Failed to refresh recording.', 'error');
+        }
+    });
+}
+
 function archiveRecording(profileId) {
     if (!confirm('Archive this recording now? The active frames are cleared after a successful archive.')) {
         return;
     }
 
     showBusy('Archiving recording...');
+    startMediaJobPolling();
+    mediaJobStage = 'Archiving recording...';
+    mediaJobProgress = 1;
+    renderMediaJobProgress();
 
     $.ajax({
         type: 'PUT',
         url: 'archive?id=' + encodeURIComponent(profileId),
         success: function() {
+            stopMediaJobPolling();
             hideBusy();
             loadRecordings();
             showToast('Recording archived.', 'success');
         },
         error: function() {
+            stopMediaJobPolling();
             hideBusy();
             showToast('Failed to archive recording.', 'error');
         }

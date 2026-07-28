@@ -29,6 +29,14 @@ static int ffmpeg_path_logged = 0;
 #define INCREMENTAL_RECENT_WINDOW_MS (2LL * 60LL * 60LL * 1000LL)
 #define INCREMENTAL_MIN_PENDING_FRAMES 15
 
+// GOP length in frames, fixed regardless of playback fps or capture interval. Sizing this
+// off fps (fps * N seconds) made keyframe count vary with the export fps setting alone, even
+// for the exact same source images (100-frame GOP at 10fps but 600-frame GOP at 60fps for the
+// same clip collapses to a single keyframe). A frame-count is the one unit that's meaningful
+// regardless of how far apart captures were in real time (1/day vs every 10s) or what fps the
+// export is played back at (10fps review vs 30-60fps "nice timelapse").
+#define EXPORT_GOP_FRAMES 100
+
 static long long monotonic_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -560,7 +568,7 @@ static int ensure_cache_dir(const char* profile_id) {
     return 1;
 }
 
-static int generate_mp4(const char* profile_id, int fps, const char* output_path, MediaKind kind) {
+static int generate_mp4(const char* profile_id, int fps, const char* output_path, MediaKind kind, int force) {
     long long started_ms = monotonic_ms();
     RecordingSnapshot snapshot;
     if (!media_ffmpeg_available() || !get_recording_snapshot(profile_id, fps, &snapshot) || !ensure_cache_dir(profile_id)) {
@@ -616,6 +624,11 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
     char fps_arg[16];
     snprintf(fps_arg, sizeof(fps_arg), "%d", clamp_fps(fps));
 
+    // Populated below only if archiving needs to prepend an already-encoded export video
+    // because the raw frames covering that range were purged by earlier export processing.
+    char export_base_path[1200];
+    export_base_path[0] = '\0';
+
     int start_number = 1;
     int frame_count = snapshot.frames;
 
@@ -655,7 +668,7 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
         frame_count = snapshot.frames - finalized_frames;
     }
 
-    int media_job = kind != MEDIA_ARCHIVE;
+    int media_job = 1;
 
     // Frame files can start at a higher index after incremental cleanup.
     char first_frame_path[1024];
@@ -673,9 +686,25 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
                          __func__, media_kind_name(kind), profile_id, finalized_frames);
             }
 
-            // If old frame chunks are already purged and no base MP4 exists, only a tail clip can be built.
-            // Fail fast so playback does not silently start from the middle of the recording timeline.
-            if (kind != MEDIA_ARCHIVE && start_number == 1 && first_available > 1 && !file_exists_nonempty(output_path)) {
+            // Archiving reads raw frames directly. If earlier frames were already folded into
+            // the export video and purged from disk, prepend that export video instead of
+            // silently building an archive that is missing its earlier portion.
+            if (kind == MEDIA_ARCHIVE && start_number == 1 && first_available > 1) {
+                if (storage_export_path(export_base_path, sizeof(export_base_path), profile_id, fps) &&
+                    file_exists_nonempty(export_base_path)) {
+                    LOG_WARN("%s: archiving with export prefix kind=%s profile=%s prefix=%s purged_through=%d\n",
+                             __func__, media_kind_name(kind), profile_id, export_base_path, first_available - 1);
+                } else {
+                    export_base_path[0] = '\0';
+                }
+            }
+
+            // If old frame chunks are already purged and no base video exists to recover from,
+            // only a tail clip can be built. Fail fast so playback/archives do not silently
+            // start from the middle of the recording timeline.
+            if (start_number == 1 && first_available > 1 &&
+                !(kind != MEDIA_ARCHIVE && file_exists_nonempty(output_path)) &&
+                !(kind == MEDIA_ARCHIVE && export_base_path[0])) {
                 if (media_job) {
                     set_media_encode_status_done(0, "Full recording unavailable; base video is missing");
                 }
@@ -709,7 +738,7 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
         return 0;
     }
 
-    if (kind != MEDIA_ARCHIVE && finalized_frames > 0 && file_exists_nonempty(output_path) &&
+    if (kind != MEDIA_ARCHIVE && !force && finalized_frames > 0 && file_exists_nonempty(output_path) &&
         !should_process_incremental_update(snapshot.last, frame_count)) {
         last_error[0] = '\0';
         LOG("%s: deferred incremental update kind=%s profile=%s pending=%d last_ms=%lld elapsed_ms=%lld\n",
@@ -719,7 +748,8 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
     }
 
     if (media_job) {
-        const char* stage = kind == MEDIA_PREVIEW ? "Preparing preview video" : "Updating recording video";
+        const char* stage = kind == MEDIA_PREVIEW ? "Preparing preview video" :
+            (kind == MEDIA_ARCHIVE ? "Archiving recording" : "Updating recording video");
         set_media_encode_status_active(stage, profile_id, fps, frame_count);
     }
 
@@ -731,6 +761,12 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
 
     const char* preset = kind == MEDIA_PREVIEW ? "ultrafast" : (kind == MEDIA_ARCHIVE ? "superfast" : "veryfast");
     const char* crf = kind == MEDIA_PREVIEW ? "30" : (kind == MEDIA_ARCHIVE ? "23" : "24");
+
+    /* Fixed frame-count GOP (not fps-scaled); sc_threshold=0 stops libx264 inserting extra
+       keyframes on scene cuts. Together these keep the keyframe cadence stable regardless of
+       capture interval or playback fps, instead of short/irregular or fps-dependent GOPs. */
+    char gop_arg[16];
+    snprintf(gop_arg, sizeof(gop_arg), "%d", EXPORT_GOP_FRAMES);
 
     unlink(temp_path);
     const char* ffmpeg_exec = resolve_ffmpeg_path();
@@ -776,6 +812,12 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
             (char*)preset,
             "-crf",
             (char*)crf,
+            "-g",
+            gop_arg,
+            "-keyint_min",
+            gop_arg,
+            "-sc_threshold",
+            "0",
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -806,6 +848,12 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
             (char*)preset,
             "-crf",
             (char*)crf,
+            "-g",
+            gop_arg,
+            "-keyint_min",
+            gop_arg,
+            "-sc_threshold",
+            "0",
             "-pix_fmt",
             "yuv420p",
             "-f",
@@ -834,6 +882,8 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
             "nv12",
             "-b:v",
             "4M",
+            "-g",
+            gop_arg,
             "-movflags",
             "+faststart",
             "-f",
@@ -862,6 +912,8 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
             "nv12",
             "-b:v",
             "4M",
+            "-g",
+            gop_arg,
             "-f",
             "mp4",
             temp_path,
@@ -878,9 +930,9 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
         gchar* stderr_text = NULL;
         gint wait_status = 0;
         long long ffmpeg_started_ms = monotonic_ms();
-        LOG("%s: ffmpeg try kind=%s profile=%s encoder=%s input=%s output=%s fps=%s start=%s frames=%s preset=%s crf=%s faststart=%s\n",
+        LOG("%s: ffmpeg try kind=%s profile=%s encoder=%s input=%s output=%s fps=%s start=%s frames=%s preset=%s crf=%s gop=%s faststart=%s\n",
             __func__, media_kind_name(kind), profile_id, encoder, input_pattern, output_path,
-            fps_arg, start_number_arg, frame_count_arg, preset, crf, use_faststart ? "on" : "off");
+            fps_arg, start_number_arg, frame_count_arg, preset, crf, gop_arg, use_faststart ? "on" : "off");
 
         gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
                                    NULL, &stderr_text, &wait_status, &error);
@@ -922,113 +974,103 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
         return 0;
     }
 
+    // For export/preview, prepend the previously-finalized portion of the same output file.
+    // For archive, prepend the export video only if raw frames were purged out from under it
+    // (export_base_path was set above); otherwise archive always has the full raw sequence.
+    const char* merge_base_path = NULL;
     if (kind != MEDIA_ARCHIVE) {
         if (finalized_frames > 0 && file_exists_nonempty(output_path)) {
-            char concat_list_path[1200];
-            char concat_output_path[1200];
-            int written_list = snprintf(concat_list_path, sizeof(concat_list_path), "%s.concat.txt", output_path);
-            int written_concat = snprintf(concat_output_path, sizeof(concat_output_path), "%s.merge.tmp", output_path);
-            if (written_list <= 0 || (size_t)written_list >= sizeof(concat_list_path) ||
-                written_concat <= 0 || (size_t)written_concat >= sizeof(concat_output_path)) {
-                if (media_job) {
-                    set_media_encode_status_done(0, "Video merge path failed");
-                }
-                set_last_error("Concat path is too long for %s", profile_id);
-                unlink(temp_path);
-                g_mutex_unlock(&encode_mutex);
-                return 0;
-            }
+            merge_base_path = output_path;
+        }
+    } else if (export_base_path[0] && file_exists_nonempty(export_base_path)) {
+        merge_base_path = export_base_path;
+    }
 
-            FILE* concat_list = fopen(concat_list_path, "w");
-            if (!concat_list) {
-                if (media_job) {
-                    set_media_encode_status_done(0, "Video merge list failed");
-                }
-                set_last_error("Failed to create concat list: %s", strerror(errno));
-                unlink(temp_path);
-                g_mutex_unlock(&encode_mutex);
-                return 0;
-            }
-            fprintf(concat_list, "file '%s'\n", output_path);
-            fprintf(concat_list, "file '%s'\n", temp_path);
-            fclose(concat_list);
-
-            char* concat_argv[] = {
-                (char*)ffmpeg_exec,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                concat_list_path,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                "-f",
-                "mp4",
-                concat_output_path,
-                NULL
-            };
-
-            GError* concat_error = NULL;
-            gchar* concat_stderr = NULL;
-            gint concat_wait_status = 0;
-            gboolean concat_ok = g_spawn_sync(NULL, concat_argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
-                                              NULL, &concat_stderr, &concat_wait_status, &concat_error);
-            unlink(concat_list_path);
-            unlink(temp_path);
-
-            if (!concat_ok || !WIFEXITED(concat_wait_status) || WEXITSTATUS(concat_wait_status) != 0) {
-                if (media_job) {
-                    set_media_encode_status_done(0, "Video merge failed");
-                }
-                set_last_error("FFmpeg concat failed: %s", concat_stderr ? concat_stderr : (concat_error ? concat_error->message : "unknown error"));
-                if (concat_error) {
-                    g_error_free(concat_error);
-                }
-                g_free(concat_stderr);
-                unlink(concat_output_path);
-                g_mutex_unlock(&encode_mutex);
-                return 0;
-            }
-
-            if (concat_error) {
-                g_error_free(concat_error);
-            }
-            g_free(concat_stderr);
-
-            if (rename(concat_output_path, output_path) == -1) {
-                if (media_job) {
-                    set_media_encode_status_done(0, "Video finalize failed");
-                }
-                set_last_error("Failed to finalize merged MP4: %s", strerror(errno));
-                unlink(concat_output_path);
-                g_mutex_unlock(&encode_mutex);
-                return 0;
-            }
-        } else if (rename(temp_path, output_path) == -1) {
+    if (merge_base_path) {
+        char concat_list_path[1200];
+        char concat_output_path[1200];
+        int written_list = snprintf(concat_list_path, sizeof(concat_list_path), "%s.concat.txt", output_path);
+        int written_concat = snprintf(concat_output_path, sizeof(concat_output_path), "%s.merge.tmp", output_path);
+        if (written_list <= 0 || (size_t)written_list >= sizeof(concat_list_path) ||
+            written_concat <= 0 || (size_t)written_concat >= sizeof(concat_output_path)) {
             if (media_job) {
-                set_media_encode_status_done(0, "Video finalize failed");
+                set_media_encode_status_done(0, "Video merge path failed");
             }
-            set_last_error("Failed to finalize MP4: %s", strerror(errno));
-            LOG_WARN("%s: finalize failed kind=%s profile=%s output=%s err=%s\n",
-                     __func__, media_kind_name(kind), profile_id, output_path, strerror(errno));
+            set_last_error("Concat path is too long for %s", profile_id);
             unlink(temp_path);
             g_mutex_unlock(&encode_mutex);
             return 0;
         }
 
-        delete_frame_range(profile_id, start_number, start_number + frame_count - 1);
-        if (!save_incremental_state(state_path, profile_id, kind, fps, snapshot.frames)) {
+        FILE* concat_list = fopen(concat_list_path, "w");
+        if (!concat_list) {
             if (media_job) {
-                set_media_encode_status_done(0, "Video state update failed");
+                set_media_encode_status_done(0, "Video merge list failed");
             }
-            set_last_error("Failed to save incremental state for %s", profile_id);
+            set_last_error("Failed to create concat list: %s", strerror(errno));
+            unlink(temp_path);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
+        fprintf(concat_list, "file '%s'\n", merge_base_path);
+        fprintf(concat_list, "file '%s'\n", temp_path);
+        fclose(concat_list);
+
+        char* concat_argv[] = {
+            (char*)ffmpeg_exec,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_list_path,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            concat_output_path,
+            NULL
+        };
+
+        GError* concat_error = NULL;
+        gchar* concat_stderr = NULL;
+        gint concat_wait_status = 0;
+        gboolean concat_ok = g_spawn_sync(NULL, concat_argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
+                                          NULL, &concat_stderr, &concat_wait_status, &concat_error);
+        unlink(concat_list_path);
+        unlink(temp_path);
+
+        if (!concat_ok || !WIFEXITED(concat_wait_status) || WEXITSTATUS(concat_wait_status) != 0) {
+            if (media_job) {
+                set_media_encode_status_done(0, "Video merge failed");
+            }
+            set_last_error("FFmpeg concat failed: %s", concat_stderr ? concat_stderr : (concat_error ? concat_error->message : "unknown error"));
+            if (concat_error) {
+                g_error_free(concat_error);
+            }
+            g_free(concat_stderr);
+            unlink(concat_output_path);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
+
+        if (concat_error) {
+            g_error_free(concat_error);
+        }
+        g_free(concat_stderr);
+
+        if (rename(concat_output_path, output_path) == -1) {
+            if (media_job) {
+                set_media_encode_status_done(0, "Video finalize failed");
+            }
+            set_last_error("Failed to finalize merged MP4: %s", strerror(errno));
+            unlink(concat_output_path);
             g_mutex_unlock(&encode_mutex);
             return 0;
         }
@@ -1042,6 +1084,18 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
         unlink(temp_path);
         g_mutex_unlock(&encode_mutex);
         return 0;
+    }
+
+    if (kind != MEDIA_ARCHIVE) {
+        delete_frame_range(profile_id, start_number, start_number + frame_count - 1);
+        if (!save_incremental_state(state_path, profile_id, kind, fps, snapshot.frames)) {
+            if (media_job) {
+                set_media_encode_status_done(0, "Video state update failed");
+            }
+            set_last_error("Failed to save incremental state for %s", profile_id);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
     }
 
     if (!write_cache_metadata(profile_id, kind, output_path, &snapshot)) {
@@ -1060,7 +1114,8 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
     LOG("%s: success kind=%s profile=%s output=%s size=%lld elapsed_ms=%lld\n",
         __func__, media_kind_name(kind), profile_id, output_path, output_size, monotonic_ms() - started_ms);
     if (media_job) {
-        set_media_encode_status_done(1, kind == MEDIA_PREVIEW ? "Preview ready" : "Recording video updated");
+        set_media_encode_status_done(1, kind == MEDIA_PREVIEW ? "Preview ready" :
+            (kind == MEDIA_ARCHIVE ? "Archive ready" : "Recording video updated"));
     }
     g_mutex_unlock(&encode_mutex);
     return 1;
@@ -1075,7 +1130,7 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
     }
 
     // Reuse the export/master path for preview to avoid duplicate heavy processing.
-    if (!generate_mp4(profile_id, fps, export_path, MEDIA_EXPORT)) {
+    if (!generate_mp4(profile_id, fps, export_path, MEDIA_EXPORT, 0)) {
         return 0;
     }
 
@@ -1093,7 +1148,7 @@ int media_generate_export(const char* profile_id, int fps, char* out_path, size_
         set_last_error("Failed to build export path for %s", profile_id);
         return 0;
     }
-    return generate_mp4(profile_id, fps, out_path, MEDIA_EXPORT);
+    return generate_mp4(profile_id, fps, out_path, MEDIA_EXPORT, 0);
 }
 
 int media_generate_archive(const char* profile_id, int fps, const char* output_path) {
@@ -1101,7 +1156,48 @@ int media_generate_archive(const char* profile_id, int fps, const char* output_p
         set_last_error("Invalid archive output path for %s", profile_id);
         return 0;
     }
-    return generate_mp4(profile_id, clamp_fps(fps), output_path, MEDIA_ARCHIVE);
+    return generate_mp4(profile_id, clamp_fps(fps), output_path, MEDIA_ARCHIVE, 0);
+}
+
+// Estimates the final export MP4 size from the currently-encoded video's own bytes-per-frame,
+// extrapolated over frames captured since it was last processed. Returns -1 if no export video
+// exists yet to sample a compression ratio from (raw JPEG size is the only signal available then).
+long long media_estimate_export_size(const char* profile_id, int fps, int current_total_frames) {
+    if (!profile_id || current_total_frames < 1) {
+        return -1;
+    }
+    fps = clamp_fps(fps);
+
+    char export_path[1024];
+    if (!storage_export_path(export_path, sizeof(export_path), profile_id, fps)) {
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(export_path, &st) != 0 || st.st_size <= 0) {
+        return -1;
+    }
+
+    char metadata_path[1200];
+    int encoded_frames = 0;
+    if (build_metadata_path(metadata_path, sizeof(metadata_path), export_path)) {
+        cJSON* root = read_json_file(metadata_path);
+        if (root) {
+            cJSON* frames_item = cJSON_GetObjectItem(root, "frames");
+            if (frames_item) {
+                encoded_frames = frames_item->valueint;
+            }
+            cJSON_Delete(root);
+        }
+    }
+
+    if (encoded_frames <= 0 || current_total_frames <= encoded_frames) {
+        return (long long)st.st_size;
+    }
+
+    double bytes_per_frame = (double)st.st_size / (double)encoded_frames;
+    int pending_frames = current_total_frames - encoded_frames;
+    return (long long)st.st_size + (long long)(bytes_per_frame * (double)pending_frames);
 }
 
 static gint64 parse_hms_us(const char* value) {
@@ -1364,7 +1460,19 @@ int media_process_pending(const char* profile_id, int fps) {
         set_last_error("Failed to build export path for %s", profile_id);
         return 0;
     }
-    return generate_mp4(profile_id, fps, output_path, MEDIA_EXPORT);
+    return generate_mp4(profile_id, fps, output_path, MEDIA_EXPORT, 0);
+}
+
+// Bypasses the incremental-batch deferral so every currently captured frame is
+// folded into the export video immediately, regardless of batch size/recency.
+int media_process_pending_force(const char* profile_id, int fps) {
+    char output_path[1024];
+    fps = clamp_fps(fps);
+    if (!storage_export_path(output_path, sizeof(output_path), profile_id, fps)) {
+        set_last_error("Failed to build export path for %s", profile_id);
+        return 0;
+    }
+    return generate_mp4(profile_id, fps, output_path, MEDIA_EXPORT, 1);
 }
 
 int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
@@ -1408,6 +1516,8 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
 
     char fps_arg[16];
     snprintf(fps_arg, sizeof(fps_arg), "%d", new_fps);
+    char gop_arg[16];
+    snprintf(gop_arg, sizeof(gop_arg), "%d", EXPORT_GOP_FRAMES);
     const char* ffmpeg_exec = resolve_ffmpeg_path();
 
     char* argv[] = {
@@ -1426,6 +1536,12 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
         "veryfast",
         "-crf",
         "24",
+        "-g",
+        gop_arg,
+        "-keyint_min",
+        gop_arg,
+        "-sc_threshold",
+        "0",
         "-pix_fmt",
         "yuv420p",
         "-movflags",

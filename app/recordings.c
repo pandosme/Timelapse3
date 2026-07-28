@@ -689,8 +689,13 @@ static void update_avi_fps(FILE* f, unsigned int fps) {
 static void normalize_mp4_filename(char* out, size_t out_len, const char* filename) {
     if (!out || out_len == 0) return;
 
+    // Copy the source out first: callers may pass out==filename, and snprintf's
+    // behavior when source and destination overlap is undefined (seen in practice
+    // to silently truncate to an empty string).
+    char source_copy[512];
     const char* source = filename && filename[0] ? filename : "timelapse.mp4";
-    snprintf(out, out_len, "%s", source);
+    snprintf(source_copy, sizeof(source_copy), "%s", source);
+    snprintf(out, out_len, "%s", source_copy);
 
     char* extension = strrchr(out, '.');
     if (extension) {
@@ -1188,6 +1193,30 @@ static void HTTP_Endpoint_Video(const ACAP_HTTP_Response response, const ACAP_HT
     stream_file_response(response, output_path, "video/mp4", "inline", "preview.mp4");
 }
 
+// Adds an "estimatedSize" field (projected final export MP4 size) to a *duplicated*
+// recording object for API responses. Never mutates the shared Recordings_Container,
+// since that object gets persisted verbatim by recording_store.c on the next capture.
+static void Attach_Estimated_Video_Size(cJSON* recording, const char* profileId) {
+    if (!recording || !profileId) {
+        return;
+    }
+    cJSON* framesItem = cJSON_GetObjectItem(recording, "frames");
+    cJSON* fpsItem = cJSON_GetObjectItem(recording, "fps");
+    int frames = framesItem ? framesItem->valueint : 0;
+    int fps = (fpsItem && fpsItem->valueint > 0) ? fpsItem->valueint : 10;
+    if (frames < 1) {
+        return;
+    }
+
+    long long estimate = media_estimate_export_size(profileId, fps, frames);
+    if (estimate < 0) {
+        return;
+    }
+
+    cJSON_DeleteItemFromObject(recording, "estimatedSize");
+    cJSON_AddNumberToObject(recording, "estimatedSize", (double)estimate);
+}
+
 static void
 HTTP_Endpoint_Recordings(const ACAP_HTTP_Response response,
                                      const ACAP_HTTP_Request request) {
@@ -1207,9 +1236,25 @@ HTTP_Endpoint_Recordings(const ACAP_HTTP_Response response,
                 ACAP_HTTP_Respond_Error(response, 404, "Recording not found");
                 return;
             }
-            ACAP_HTTP_Respond_JSON(response, recording);
+            cJSON* out = cJSON_Duplicate(recording, 1);
+            if (!out) {
+                ACAP_HTTP_Respond_JSON(response, recording);
+                return;
+            }
+            Attach_Estimated_Video_Size(out, profileId);
+            ACAP_HTTP_Respond_JSON(response, out);
+            cJSON_Delete(out);
         } else {
-            ACAP_HTTP_Respond_JSON(response, Recordings_Container);
+            cJSON* out = cJSON_Duplicate(Recordings_Container, 1);
+            if (!out) {
+                ACAP_HTTP_Respond_JSON(response, Recordings_Container);
+                return;
+            }
+            for (cJSON* item = out->child; item; item = item->next) {
+                Attach_Estimated_Video_Size(item, item->string);
+            }
+            ACAP_HTTP_Respond_JSON(response, out);
+            cJSON_Delete(out);
         }
         return;
     }
@@ -1228,6 +1273,31 @@ HTTP_Endpoint_Recordings(const ACAP_HTTP_Response response,
 		}
 		return;
 	}
+
+    if (strcmp(method, "PUT") == 0) {
+        const char* profileId = ACAP_HTTP_Request_Param(request, "id");
+        if (!profileId) {
+            ACAP_HTTP_Respond_Error(response, 400, "Missing profile ID");
+            return;
+        }
+
+        cJSON* profile = Timelapse_Find_Profile_By_Id(profileId);
+        if (!profile) {
+            ACAP_HTTP_Respond_Error(response, 404, "Profile not found");
+            return;
+        }
+        cJSON* fpsItem = cJSON_GetObjectItem(profile, "fps");
+        int fps = fpsItem ? fpsItem->valueint : 10;
+
+        LOG("%s: force-processing pending chunks profile=%s fps=%d\n", __func__, profileId, fps);
+        if (media_process_pending_force(profileId, fps)) {
+            ACAP_HTTP_Respond_Text(response, "Recording refreshed");
+        } else {
+            LOG_WARN("%s: refresh failed profile=%s err=%s\n", __func__, profileId, media_last_error());
+            ACAP_HTTP_Respond_Error(response, 500, media_last_error());
+        }
+        return;
+    }
 
     ACAP_HTTP_Respond_Error(response, 405, "Method not allowed");
 }
