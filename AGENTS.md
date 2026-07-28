@@ -27,8 +27,12 @@ on missing headers, and that failure tells you nothing about whether the code is
 The real build is Docker-based:
 
 ```sh
-./build.sh          # builds both aarch64 and armv7hf .eap packages
+./build.sh          # builds the aarch64 .eap package
 ```
+
+armv7hf is intentionally commented out in `build.sh` — those cameras won't get AXIS OS 12.x
+(this app's `compatibleOsVersions` floor in `app/manifest.json`), so there's no point building
+for that arch. `third_party/ffmpeg/armv7hf/` is left in place in case that changes.
 
 `Dockerfile` pulls `axisecp/acap-native-sdk:<version>-<arch>-ubuntuXX.XX`, copies `app/` in, copies
 a prebuilt `ffmpeg` binary from `third_party/ffmpeg/<arch>/ffmpeg` into `bin/`, and runs
@@ -119,9 +123,23 @@ inline `<script>` block. Edit it directly; there's no bundler/transpiler in fron
 
 ## Storage layout on the camera
 
+`storage_ensure_root()` (`storage.c`) resolves the actual root at startup by searching, in order,
+for an existing `timelapse2` directory: the modern AXIS "storage areas" path
+(`/var/spool/storage/areas/SD_DISK/root`), the legacy path (`/var/spool/storage/SD_DISK`), then a
+uid-scoped variant of the legacy path. Whichever one already has a `timelapse2` directory wins, so
+upgrades and firmware differences don't strand a camera's existing data; if none exists yet
+(fresh install), it creates one in the first candidate that's actually writable, same order.
+**There is deliberately no internal-flash fallback** — recordings only ever belong on the SD card;
+if no candidate is usable, `storage_ensure_root()` fails and the app reports no SD card rather than
+silently writing somewhere small and non-persistent. (An internal-flash fallback existed briefly
+and was removed after it caused exactly that: silent recording into
+`/usr/local/packages/timelapse2/localdata`, which is wiped on a full uninstall/reinstall — see git
+history around the storage.c rewrite if you need the postmortem.) The two real AXIS OS mount
+layouts differ by device/firmware: some only bind-mount the SD card at the legacy path, some only
+at the areas path, and some (older/other firmware) dual-mount it at both.
+
 ```
-/var/spool/storage/SD_DISK/timelapse2/          (STORAGE_ROOT, falls back to a uid-scoped or
-                                                  /usr/local/packages path if unavailable)
+<SD card>/timelapse2/                           (path varies - see storage_ensure_root() above)
   profiles.json                                 timelapse profile definitions
   recordings.json                               recording_store state (frame counts, byte totals, fps, ...)
   profiles/<profileId>/

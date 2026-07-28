@@ -26,8 +26,12 @@ static int ffmpeg_path_resolved = 0;
 static int ffmpeg_path_logged = 0;
 
 #define REENCODE_EST_MBPS 2.5
-#define INCREMENTAL_RECENT_WINDOW_MS (2LL * 60LL * 60LL * 1000LL)
-#define INCREMENTAL_MIN_PENDING_FRAMES 15
+// Batches are only flushed into the permanent export cache once genuinely quiet (no new
+// capture for this long) OR once INCREMENTAL_MIN_PENDING_FRAMES have piled up - whichever
+// comes first. Sized to land close to EXPORT_GOP_FRAMES so a batch boundary roughly coincides
+// with where a periodic keyframe would land anyway, instead of forcing extra ones.
+#define INCREMENTAL_QUIET_WINDOW_MS (2LL * 60LL * 60LL * 1000LL)
+#define INCREMENTAL_MIN_PENDING_FRAMES 500
 
 // GOP length in frames, fixed regardless of playback fps or capture interval. Sizing this
 // off fps (fps * N seconds) made keyframe count vary with the export fps setting alone, even
@@ -96,7 +100,15 @@ static int clamp_fps(int fps) {
     return fps;
 }
 
+// Decides whether a batch smaller than INCREMENTAL_MIN_PENDING_FRAMES is still worth flushing
+// now. Answer: only once capture has gone quiet for a while - if it's still actively capturing,
+// waiting produces a better (larger, more GOP-aligned) batch; once quiet, there's nothing to be
+// gained by waiting longer, so flush whatever's pending rather than leaving the export stale.
 static int should_process_incremental_update(long long last_frame_ms, int pending_frames) {
+    if (pending_frames < 1) {
+        return 0;
+    }
+
     if (pending_frames >= INCREMENTAL_MIN_PENDING_FRAMES) {
         return 1;
     }
@@ -107,7 +119,7 @@ static int should_process_incremental_update(long long last_frame_ms, int pendin
 
     long long now_ms = (long long)time(NULL) * 1000LL;
     long long age_ms = now_ms - last_frame_ms;
-    return age_ms <= INCREMENTAL_RECENT_WINDOW_MS;
+    return age_ms >= INCREMENTAL_QUIET_WINDOW_MS;
 }
 
 static void set_reencode_status_active(const char* profile_id, int old_fps, int new_fps, long long input_bytes) {
@@ -1121,24 +1133,292 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
     return 1;
 }
 
+// Builds a disposable "Play" preview: the existing export cache (stream-copied, free) plus a
+// fast/cheap encode of whatever hasn't been folded into that cache yet. Unlike generate_mp4(),
+// this NEVER purges raw frames, NEVER updates the export's incremental state, and NEVER writes
+// cache metadata for its own output - it can be regenerated from scratch on every single call
+// with zero lasting effect. That's deliberate: the permanent export cache's GOP quality must
+// only ever be touched by the periodic sweep or an explicit Download (both use generate_mp4()'s
+// proper -g/-sc_threshold-tuned encode), never by how many times someone clicks Play.
 int media_generate_preview(const char* profile_id, int fps, char* out_path, size_t out_len) {
-    char export_path[1024];
+    if (!media_ffmpeg_available()) {
+        set_last_error("ffmpeg not available for %s", profile_id);
+        return 0;
+    }
     fps = clamp_fps(fps);
+
+    RecordingSnapshot snapshot;
+    if (!get_recording_snapshot(profile_id, fps, &snapshot)) {
+        return 0;
+    }
+
+    char export_path[1024];
     if (!storage_export_path(export_path, sizeof(export_path), profile_id, fps)) {
         set_last_error("Failed to build export path for %s", profile_id);
         return 0;
     }
 
-    // Reuse the export/master path for preview to avoid duplicate heavy processing.
-    if (!generate_mp4(profile_id, fps, export_path, MEDIA_EXPORT, 0)) {
+    int have_export = file_exists_nonempty(export_path);
+    int encoded_frames = 0;
+    if (have_export) {
+        char metadata_path[1200];
+        if (build_metadata_path(metadata_path, sizeof(metadata_path), export_path)) {
+            cJSON* root = read_json_file(metadata_path);
+            if (root) {
+                cJSON* frames_item = cJSON_GetObjectItem(root, "frames");
+                if (frames_item) {
+                    encoded_frames = frames_item->valueint;
+                }
+                cJSON_Delete(root);
+            }
+        }
+    }
+
+    char preview_path[1024];
+    if (!storage_preview_path(preview_path, sizeof(preview_path), profile_id, fps)) {
+        set_last_error("Failed to build preview path for %s", profile_id);
         return 0;
     }
 
-    if (snprintf(out_path, out_len, "%s", export_path) <= 0 || strlen(export_path) >= out_len) {
+    // Nothing pending: the export cache already covers everything captured so far, so it's
+    // both correct and free to just point at it directly instead of building a separate file.
+    if (have_export && snapshot.frames <= encoded_frames) {
+        if (snprintf(out_path, out_len, "%s", export_path) <= 0 || strlen(export_path) >= out_len) {
+            set_last_error("Failed to return preview path for %s", profile_id);
+            return 0;
+        }
+        return 1;
+    }
+
+    // A previous call already built a preview covering everything captured so far - reuse it
+    // instead of redoing the tail encode. This is what makes a "prepare, then fetch" two-step
+    // Play flow (or repeated Play clicks with nothing new captured) cheap.
+    char preview_meta_path[1200];
+    int preview_meta_written = snprintf(preview_meta_path, sizeof(preview_meta_path), "%s.frames", preview_path);
+    int have_preview_meta = preview_meta_written > 0 && (size_t)preview_meta_written < sizeof(preview_meta_path);
+    if (have_preview_meta && file_exists_nonempty(preview_path)) {
+        FILE* meta_file = fopen(preview_meta_path, "r");
+        if (meta_file) {
+            int preview_frames = 0;
+            int matched = fscanf(meta_file, "%d", &preview_frames) == 1 && preview_frames == snapshot.frames;
+            fclose(meta_file);
+            if (matched) {
+                if (snprintf(out_path, out_len, "%s", preview_path) <= 0 || strlen(preview_path) >= out_len) {
+                    set_last_error("Failed to return preview path for %s", profile_id);
+                    return 0;
+                }
+                return 1;
+            }
+        }
+    }
+
+    if (!g_mutex_trylock(&encode_mutex)) {
+        set_last_error("Media generation is already running for %s", profile_id);
+        return 0;
+    }
+
+    char frames_dir[1024];
+    if (!storage_frames_dir(frames_dir, sizeof(frames_dir), profile_id)) {
+        set_last_error("Failed to build frame directory for %s", profile_id);
+        g_mutex_unlock(&encode_mutex);
+        return 0;
+    }
+
+    char input_pattern[1200];
+    int written = snprintf(input_pattern, sizeof(input_pattern), "%s/%%08d.jpg", frames_dir);
+    if (written <= 0 || (size_t)written >= sizeof(input_pattern)) {
+        set_last_error("Frame input path is too long for %s", profile_id);
+        g_mutex_unlock(&encode_mutex);
+        return 0;
+    }
+
+    int start_number = encoded_frames + 1;
+    int frame_count = snapshot.frames - encoded_frames;
+
+    // Frame files can start at a higher index than expected if older chunks were already
+    // purged by a real export/archive pass; fall back to whatever's actually still on disk.
+    char first_frame_path[1024];
+    if (!storage_frame_path(first_frame_path, sizeof(first_frame_path), profile_id, (unsigned)start_number) ||
+        access(first_frame_path, R_OK) != 0) {
+        int first_available = 0, last_available = 0, frame_files = 0;
+        if (!detect_frame_bounds(profile_id, &first_available, &last_available, &frame_files)) {
+            set_last_error("No frame files available for %s", profile_id);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
+        start_number = first_available;
+        frame_count = last_available - first_available + 1;
+    }
+
+    if (frame_count < 1) {
+        set_last_error("No frame files available for %s", profile_id);
+        g_mutex_unlock(&encode_mutex);
+        return 0;
+    }
+
+    char fps_arg[16];
+    snprintf(fps_arg, sizeof(fps_arg), "%d", fps);
+    char start_number_arg[16];
+    snprintf(start_number_arg, sizeof(start_number_arg), "%d", start_number);
+    char frame_count_arg[16];
+    snprintf(frame_count_arg, sizeof(frame_count_arg), "%d", frame_count);
+
+    char tail_path[1200];
+    written = snprintf(tail_path, sizeof(tail_path), "%s.tail.tmp", preview_path);
+    if (written <= 0 || (size_t)written >= sizeof(tail_path)) {
+        set_last_error("Preview temp path is too long for %s", profile_id);
+        g_mutex_unlock(&encode_mutex);
+        return 0;
+    }
+    unlink(tail_path);
+
+    const char* ffmpeg_exec = resolve_ffmpeg_path();
+    char* tail_argv[] = {
+        (char*)ffmpeg_exec,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-framerate",
+        fps_arg,
+        "-start_number",
+        start_number_arg,
+        "-i",
+        input_pattern,
+        "-frames:v",
+        frame_count_arg,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "30",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "mp4",
+        tail_path,
+        NULL
+    };
+
+    GError* error = NULL;
+    gchar* stderr_text = NULL;
+    gint wait_status = 0;
+    long long tail_started_ms = monotonic_ms();
+    LOG("%s: tail encode profile=%s start=%s frames=%s\n", __func__, profile_id, start_number_arg, frame_count_arg);
+    gboolean ok = g_spawn_sync(NULL, tail_argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
+                               NULL, &stderr_text, &wait_status, &error);
+    if (!ok || !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+        set_last_error("Preview encode failed: %s", stderr_text ? stderr_text : (error ? error->message : "unknown error"));
+        LOG_WARN("%s: tail encode failed profile=%s err=%s\n", __func__, profile_id, last_error);
+        if (error) {
+            g_error_free(error);
+        }
+        g_free(stderr_text);
+        unlink(tail_path);
+        g_mutex_unlock(&encode_mutex);
+        return 0;
+    }
+    if (error) {
+        g_error_free(error);
+    }
+    g_free(stderr_text);
+    LOG("%s: tail encode done profile=%s elapsed_ms=%lld\n", __func__, profile_id, monotonic_ms() - tail_started_ms);
+
+    unlink(preview_path);
+
+    if (!have_export) {
+        // No export cache yet - the tail is the whole preview.
+        if (rename(tail_path, preview_path) == -1) {
+            set_last_error("Failed to finalize preview: %s", strerror(errno));
+            unlink(tail_path);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
+    } else {
+        // Prepend the export cache (stream copy, cheap) ahead of the fresh tail.
+        char concat_list_path[1200];
+        written = snprintf(concat_list_path, sizeof(concat_list_path), "%s.concat.txt", preview_path);
+        if (written <= 0 || (size_t)written >= sizeof(concat_list_path)) {
+            set_last_error("Preview concat path is too long for %s", profile_id);
+            unlink(tail_path);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
+
+        FILE* concat_list = fopen(concat_list_path, "w");
+        if (!concat_list) {
+            set_last_error("Failed to create preview concat list: %s", strerror(errno));
+            unlink(tail_path);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
+        fprintf(concat_list, "file '%s'\n", export_path);
+        fprintf(concat_list, "file '%s'\n", tail_path);
+        fclose(concat_list);
+
+        char* concat_argv[] = {
+            (char*)ffmpeg_exec,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_list_path,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            preview_path,
+            NULL
+        };
+
+        GError* concat_error = NULL;
+        gchar* concat_stderr = NULL;
+        gint concat_wait_status = 0;
+        gboolean concat_ok = g_spawn_sync(NULL, concat_argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
+                                          NULL, &concat_stderr, &concat_wait_status, &concat_error);
+        unlink(concat_list_path);
+        unlink(tail_path);
+
+        if (!concat_ok || !WIFEXITED(concat_wait_status) || WEXITSTATUS(concat_wait_status) != 0) {
+            set_last_error("Preview merge failed: %s", concat_stderr ? concat_stderr : (concat_error ? concat_error->message : "unknown error"));
+            if (concat_error) {
+                g_error_free(concat_error);
+            }
+            g_free(concat_stderr);
+            unlink(preview_path);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
+        if (concat_error) {
+            g_error_free(concat_error);
+        }
+        g_free(concat_stderr);
+    }
+
+    g_mutex_unlock(&encode_mutex);
+
+    // Record what this preview now covers so the next call (or a poll-driven "prepare" step
+    // right before this one) can skip redoing the work if nothing new has been captured since.
+    if (have_preview_meta) {
+        FILE* meta_file = fopen(preview_meta_path, "w");
+        if (meta_file) {
+            fprintf(meta_file, "%d", snapshot.frames);
+            fclose(meta_file);
+        }
+    }
+
+    if (snprintf(out_path, out_len, "%s", preview_path) <= 0 || strlen(preview_path) >= out_len) {
         set_last_error("Failed to return preview path for %s", profile_id);
         return 0;
     }
-
     return 1;
 }
 

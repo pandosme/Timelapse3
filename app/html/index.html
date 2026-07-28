@@ -462,6 +462,106 @@ function renderMediaJobProgress() {
     $('#busyModalProgressBar').css('width', percent + '%').text(percentText + '%');
 }
 
+// Starts (or restarts) the 1s progress-bar render loop. Call before an action that will be
+// tracked via waitForMediaJobDone(); pair with endMediaJobUi() once it resolves.
+function beginMediaJobUi(stage) {
+    mediaJobClientStartMs = Date.now();
+    mediaJobStage = stage;
+    mediaJobEstimateSec = 0;
+    mediaJobProgress = 1;
+    renderMediaJobProgress();
+    if (mediaJobUiTimer) {
+        clearInterval(mediaJobUiTimer);
+    }
+    mediaJobUiTimer = setInterval(renderMediaJobProgress, 1000);
+}
+
+function endMediaJobUi() {
+    if (mediaJobUiTimer) {
+        clearInterval(mediaJobUiTimer);
+        mediaJobUiTimer = null;
+    }
+}
+
+// Polls GET status until the backend's "mediaJob" is no longer active, then calls
+// onDone(ok, message) exactly once. The server always flips "active" to true (synchronously,
+// before responding) when a background job is queued and back to false exactly once when it
+// finishes - see Queue_Refresh_Media/Queue_Archive_Media/Queue_Preview_Media in recordings.c -
+// so this never needs to guess whether a job "counts": the very next poll after the triggering
+// request succeeds reflects real state. timeoutMs is a hard safety net so this can never wait
+// forever even if something unexpected happens server-side.
+function waitForMediaJobDone(timeoutMs, onDone) {
+    const deadline = Date.now() + (timeoutMs || 5 * 60 * 1000);
+    let done = false;
+
+    function poll() {
+        if (done) {
+            return;
+        }
+        if (Date.now() > deadline) {
+            done = true;
+            onDone(false, 'Timed out waiting for the camera to finish.');
+            return;
+        }
+        $.ajax({ url: 'status', method: 'GET', cache: false, timeout: 4000, dataType: 'json' })
+            .done(function(resp) {
+                if (done) {
+                    return;
+                }
+                const media = resp && resp.mediaJob;
+                if (media && media.active) {
+                    mediaJobStage = media.stage || mediaJobStage;
+                    mediaJobEstimateSec = Number(media.estimatedSeconds || 0);
+                    mediaJobProgress = Number(media.progress || 0);
+                    setTimeout(poll, 1000);
+                    return;
+                }
+                done = true;
+                const message = media ? media.message : '';
+                const failed = !!media && Number(media.progress || 0) <= 0 && /fail|error/i.test(message || '');
+                onDone(!failed, message);
+            })
+            .fail(function() {
+                // Transient poll failure (e.g. one dropped request) - keep trying until deadline
+                // rather than giving up on the first hiccup.
+                setTimeout(poll, 1000);
+            });
+    }
+
+    poll();
+}
+
+// Shared by Play/Export: makes sure the export MP4 is fully caught up (as a background job) so
+// the actual video/export GET afterward is a fast cache hit instead of a request that blocks the
+// app's single request-handling thread for however long the encode takes.
+// Queues a background job via PUT putUrl, waits for it to finish, then calls onReady(). Used
+// by both Play (PUT video - disposable preview) and Download (PUT recordings - real export
+// catch-up); which one just depends on putUrl.
+function runBackgroundJobThen(putUrl, onReady) {
+    beginMediaJobUi(mediaJobStage);
+
+    $.ajax({
+        type: 'PUT',
+        url: putUrl,
+        success: function() {
+            waitForMediaJobDone(5 * 60 * 1000, function(ok, message) {
+                endMediaJobUi();
+                if (ok) {
+                    onReady();
+                } else {
+                    hideBusy();
+                    showToast(message || 'Failed to prepare recording.', 'error');
+                }
+            });
+        },
+        error: function() {
+            endMediaJobUi();
+            hideBusy();
+            showToast('Failed to prepare recording.', 'error');
+        }
+    });
+}
+
 function pollMediaJobStatus() {
     if (mediaJobRequestInFlight) {
         return;
@@ -679,7 +779,6 @@ $(document).ready(function() {
         if (action === 'play-archive') playArchive(filename);
         if (action === 'download-archive') downloadArchive(filename);
         if (action === 'archive') archiveRecording(id);
-        if (action === 'refresh') refreshRecording(id);
         if (action === 'reset-live') resetLiveMedia(id);
         if (action === 'delete-live') deleteLiveRecording(id);
         if (action === 'edit') editTimelapse(id);
@@ -797,7 +896,6 @@ function renderRecordings() {
         }
         menuItems.push({ action: 'edit', id: id, label: 'Edit' });
         if (hasFrames) {
-            menuItems.push({ action: 'refresh', id: id, label: 'Refresh' });
             if ((profile.archiveSchedule || 'monthly') !== 'none') {
                 menuItems.push({ action: 'archive', id: id, label: 'Archive' });
             }
@@ -877,53 +975,53 @@ function playRecording(id) {
     video.pause();
 
     showBusy('Preparing video');
-    startMediaJobPolling();
     mediaJobStage = 'Preparing video';
-    mediaJobProgress = 1;
-    renderMediaJobProgress();
+    runBackgroundJobThen('video?id=' + encodeURIComponent(id) + '&fps=' + encodeURIComponent(fps), function() {
+        mediaJobStage = 'Loading video';
 
-    let settled = false;
-    let timeoutId = null;
+        let settled = false;
+        let timeoutId = null;
 
-    const cleanupHandlers = function() {
-        video.onloadeddata = null;
-        video.oncanplay = null;
-        video.onerror = null;
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            timeoutId = null;
-        }
-    };
+        const cleanupHandlers = function() {
+            video.onloadeddata = null;
+            video.oncanplay = null;
+            video.onerror = null;
+            if (timeoutId) {
+                clearTimeout(timeoutId);
+                timeoutId = null;
+            }
+        };
 
-    const onReady = function() {
-        if (settled) return;
-        settled = true;
-        cleanupHandlers();
-        stopMediaJobPolling();
-        hideBusy();
-        showModal('playModal');
-    };
+        const onReady = function() {
+            if (settled) return;
+            settled = true;
+            cleanupHandlers();
+            hideBusy();
+            showModal('playModal');
+        };
 
-    const onError = function() {
-        if (settled) return;
-        settled = true;
-        cleanupHandlers();
-        stopMediaJobPolling();
-        hideBusy();
-        showToast('Failed to prepare video.', 'error');
-    };
+        const onError = function() {
+            if (settled) return;
+            settled = true;
+            cleanupHandlers();
+            hideBusy();
+            showToast('Failed to prepare video.', 'error');
+        };
 
-    video.onloadeddata = onReady;
-    video.oncanplay = onReady;
-    video.onerror = onError;
+        video.onloadeddata = onReady;
+        video.oncanplay = onReady;
+        video.onerror = onError;
 
-    timeoutId = setTimeout(function() {
-        onError();
-    }, 120000);
+        // The PUT above already built/refreshed the disposable preview, so this is now
+        // expected to be a fast fetch - 30s is generous, not a wait for the tail encode.
+        timeoutId = setTimeout(function() {
+            onError();
+        }, 30000);
 
-    video.currentTime = 0;
-    video.src = 'video?id=' + encodeURIComponent(id) + '&fps=' + encodeURIComponent(fps) + '&_=' + Date.now();
-    video.load();
+        video.currentTime = 0;
+        video.src = 'video?id=' + encodeURIComponent(id) + '&fps=' + encodeURIComponent(fps) + '&_=' + Date.now();
+        video.load();
+    });
 }
 
 function playArchive(filename) {
@@ -976,16 +1074,19 @@ function playArchive(filename) {
 
 function exportRecording(id) {
     showBusy('Preparing export...');
-    const form = document.createElement('form');
-    form.method = 'GET';
-    form.action = 'export';
+    mediaJobStage = 'Preparing export...';
+    runBackgroundJobThen('recordings?id=' + encodeURIComponent(id), function() {
+        hideBusy();
+        const form = document.createElement('form');
+        form.method = 'GET';
+        form.action = 'export';
 
-    appendHiddenField(form, 'id', id);
+        appendHiddenField(form, 'id', id);
 
-    document.body.appendChild(form);
-    form.submit();
-    document.body.removeChild(form);
-    setTimeout(hideBusy, 1200);
+        document.body.appendChild(form);
+        form.submit();
+        document.body.removeChild(form);
+    });
 }
 
 function saveProfile(e) {
@@ -1191,52 +1292,29 @@ function deleteLiveRecording(id) {
     });
 }
 
-function refreshRecording(id) {
-    showBusy('Refreshing recording...');
-    startMediaJobPolling();
-    mediaJobStage = 'Refreshing recording...';
-    mediaJobProgress = 1;
-    renderMediaJobProgress();
-
-    $.ajax({
-        type: 'PUT',
-        url: 'recordings?id=' + encodeURIComponent(id),
-        success: function() {
-            stopMediaJobPolling();
-            hideBusy();
-            loadRecordings();
-            showToast('Recording refreshed.', 'success');
-        },
-        error: function() {
-            stopMediaJobPolling();
-            hideBusy();
-            showToast('Failed to refresh recording.', 'error');
-        }
-    });
-}
-
 function archiveRecording(profileId) {
     if (!confirm('Archive this recording now? The active frames are cleared after a successful archive.')) {
         return;
     }
 
     showBusy('Archiving recording...');
-    startMediaJobPolling();
-    mediaJobStage = 'Archiving recording...';
-    mediaJobProgress = 1;
-    renderMediaJobProgress();
+    beginMediaJobUi('Archiving recording...');
 
     $.ajax({
         type: 'PUT',
         url: 'archive?id=' + encodeURIComponent(profileId),
         success: function() {
-            stopMediaJobPolling();
-            hideBusy();
-            loadRecordings();
-            showToast('Recording archived.', 'success');
+            // Archive is always a full re-encode (never a cache hit), so give it more room
+            // than a Download catch-up before treating it as timed out.
+            waitForMediaJobDone(10 * 60 * 1000, function(ok, message) {
+                endMediaJobUi();
+                hideBusy();
+                loadRecordings();
+                showToast(ok ? 'Recording archived.' : (message || 'Failed to archive recording.'), ok ? 'success' : 'error');
+            });
         },
         error: function() {
-            stopMediaJobPolling();
+            endMediaJobUi();
             hideBusy();
             showToast('Failed to archive recording.', 'error');
         }

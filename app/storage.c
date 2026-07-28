@@ -18,6 +18,11 @@ static int build_uid_storage_root(char* out, size_t out_len) {
     return written > 0 && (size_t)written < out_len;
 }
 
+static int dir_exists(const char* path) {
+    struct stat st;
+    return path && path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 static int set_error(char* error, size_t error_len, const char* fmt, const char* path) {
     if (error && error_len > 0) {
         snprintf(error, error_len, fmt, path, strerror(errno));
@@ -70,49 +75,78 @@ int storage_join(char* out, size_t out_len, const char* first, const char* secon
 
 int storage_ensure_root(char* error, size_t error_len) {
     const char* env_root = getenv("STORAGE_ROOT");
-    const char* preferred_root = (env_root && env_root[0]) ? env_root : STORAGE_ROOT;
+    if (env_root && env_root[0]) {
+        char env_error[256];
+        if (ensure_root_candidate(env_root, env_error, sizeof(env_error))) {
+            snprintf(active_storage_root, sizeof(active_storage_root), "%s", env_root);
+            active_storage_root_initialized = 1;
+            if (error && error_len > 0) {
+                error[0] = '\0';
+            }
+            return 1;
+        }
+        if (error && error_len > 0) {
+            snprintf(error, error_len, "STORAGE_ROOT override unusable: %s (%s)", env_root, env_error);
+        }
+        return 0;
+    }
+
+    char sd_areas_root[1024];
     char uid_root[1024];
+    int sd_areas_ready = storage_join(sd_areas_root, sizeof(sd_areas_root), STORAGE_SD_AREAS_BASE, "timelapse2");
     int uid_root_ready = build_uid_storage_root(uid_root, sizeof(uid_root));
-    char preferred_error[256];
-    char uid_error[256];
-    char fallback_error[256];
 
-    if (ensure_root_candidate(preferred_root, preferred_error, sizeof(preferred_error))) {
-        snprintf(active_storage_root, sizeof(active_storage_root), "%s", preferred_root);
-        active_storage_root_initialized = 1;
-        if (error && error_len > 0) {
-            error[0] = '\0';
+    // Deliberately no internal-flash fallback: recordings only ever belong on the SD card. If
+    // neither SD card path is usable, storage_ensure_root() must fail so the app reports "no SD
+    // card" instead of silently recording somewhere small, non-persistent, and wiped on reinstall.
+    struct { const char* path; int ready; } candidates[] = {
+        { sd_areas_root, sd_areas_ready },   // modern AXIS OS "storage areas" path - the real SD card
+                                              // on devices where the legacy path below isn't usable
+        { STORAGE_ROOT, 1 },                 // legacy path - the real SD card on older/other devices
+        { uid_root, uid_root_ready },        // legacy path, uid-scoped (pre-existing edge case)
+    };
+    const int candidate_count = (int)(sizeof(candidates) / sizeof(candidates[0]));
+
+    // First pass: if a "timelapse2" directory already exists in any candidate, keep using it.
+    // A camera's data should never get stranded just because this priority order changed, or
+    // because its firmware happens to mount the SD card at a different one of these paths.
+    for (int i = 0; i < candidate_count; i++) {
+        if (candidates[i].ready && dir_exists(candidates[i].path) &&
+            access(candidates[i].path, R_OK | W_OK | X_OK) == 0) {
+            snprintf(active_storage_root, sizeof(active_storage_root), "%s", candidates[i].path);
+            active_storage_root_initialized = 1;
+            if (error && error_len > 0) {
+                error[0] = '\0';
+            }
+            return 1;
         }
-        return 1;
     }
 
-    if (uid_root_ready && ensure_root_candidate(uid_root, uid_error, sizeof(uid_error))) {
-        snprintf(active_storage_root, sizeof(active_storage_root), "%s", uid_root);
-        active_storage_root_initialized = 1;
-        if (error && error_len > 0) {
-            error[0] = '\0';
+    // Second pass: nothing exists yet (fresh install) - create the first candidate that's
+    // actually writable, in priority order.
+    char attempt_errors[3][256];
+    for (int i = 0; i < candidate_count; i++) {
+        attempt_errors[i][0] = '\0';
+        if (!candidates[i].ready) {
+            snprintf(attempt_errors[i], sizeof(attempt_errors[i]), "path unavailable");
+            continue;
         }
-        return 1;
-    }
-
-    if (ensure_root_candidate(STORAGE_FALLBACK_ROOT, fallback_error, sizeof(fallback_error))) {
-        snprintf(active_storage_root, sizeof(active_storage_root), "%s", STORAGE_FALLBACK_ROOT);
-        active_storage_root_initialized = 1;
-        if (error && error_len > 0) {
-            error[0] = '\0';
+        if (ensure_root_candidate(candidates[i].path, attempt_errors[i], sizeof(attempt_errors[i]))) {
+            snprintf(active_storage_root, sizeof(active_storage_root), "%s", candidates[i].path);
+            active_storage_root_initialized = 1;
+            if (error && error_len > 0) {
+                error[0] = '\0';
+            }
+            return 1;
         }
-        return 1;
     }
 
     if (error && error_len > 0) {
         snprintf(error, error_len,
-                 "Storage unavailable. preferred='%s' error='%s'; uidRoot='%s' error='%s'; fallback='%s' error='%s'",
-                 preferred_root,
-                 preferred_error,
-                 uid_root_ready ? uid_root : "(unavailable)",
-                 uid_root_ready ? uid_error : "unable to build uid root",
-                 STORAGE_FALLBACK_ROOT,
-                 fallback_error);
+                 "SD card unavailable. areas='%s' (%s); legacy='%s' (%s); uid='%s' (%s)",
+                 candidates[0].path, attempt_errors[0],
+                 candidates[1].path, attempt_errors[1],
+                 candidates[2].ready ? candidates[2].path : "(unavailable)", attempt_errors[2]);
     }
     return 0;
 }
