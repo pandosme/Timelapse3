@@ -172,6 +172,7 @@ static void Set_Reset_Media_Status_Done(int ok, const char* message) {
 static gpointer Reset_Media_Thread(gpointer user_data) {
     ResetMediaTask* task = (ResetMediaTask*)user_data;
     if (!task) {
+        ACAP_Background_Job_End();
         return NULL;
     }
 
@@ -186,6 +187,7 @@ static gpointer Reset_Media_Thread(gpointer user_data) {
     }
 
     g_free(task);
+    ACAP_Background_Job_End();
     return NULL;
 }
 
@@ -202,8 +204,10 @@ static int Queue_Reset_Media(const char* profile_id) {
     snprintf(task->profile_id, sizeof(task->profile_id), "%s", profile_id);
     Set_Reset_Media_Status_Active(profile_id);
 
+    ACAP_Background_Job_Begin();
     GThread* thread = g_thread_new("reset-media", Reset_Media_Thread, task);
     if (!thread) {
+        ACAP_Background_Job_End();
         g_free(task);
         Set_Reset_Media_Status_Done(0, "Failed to start media reset");
         return 0;
@@ -264,6 +268,7 @@ static void Set_Refresh_Status_Done(int ok, const char* message) {
 static gpointer Refresh_Media_Thread(gpointer user_data) {
     RefreshTask* task = (RefreshTask*)user_data;
     if (!task) {
+        ACAP_Background_Job_End();
         return NULL;
     }
 
@@ -278,6 +283,7 @@ static gpointer Refresh_Media_Thread(gpointer user_data) {
     }
 
     g_free(task);
+    ACAP_Background_Job_End();
     return NULL;
 }
 
@@ -295,8 +301,10 @@ static int Queue_Refresh_Media(const char* profile_id, int fps) {
     task->fps = fps;
     Set_Refresh_Status_Active(profile_id);
 
+    ACAP_Background_Job_Begin();
     GThread* thread = g_thread_new("refresh-media", Refresh_Media_Thread, task);
     if (!thread) {
+        ACAP_Background_Job_End();
         g_free(task);
         Set_Refresh_Status_Done(0, "Failed to start refresh");
         return 0;
@@ -328,6 +336,7 @@ static void Set_Archive_Status_Done(int ok, const char* message) {
 static gpointer Archive_Media_Thread(gpointer user_data) {
     ArchiveTask* task = (ArchiveTask*)user_data;
     if (!task) {
+        ACAP_Background_Job_End();
         return NULL;
     }
 
@@ -342,6 +351,7 @@ static gpointer Archive_Media_Thread(gpointer user_data) {
     }
 
     g_free(task);
+    ACAP_Background_Job_End();
     return NULL;
 }
 
@@ -358,8 +368,10 @@ static int Queue_Archive_Media(const char* profile_id) {
     snprintf(task->profile_id, sizeof(task->profile_id), "%s", profile_id);
     Set_Archive_Status_Active(profile_id);
 
+    ACAP_Background_Job_Begin();
     GThread* thread = g_thread_new("archive-media", Archive_Media_Thread, task);
     if (!thread) {
+        ACAP_Background_Job_End();
         g_free(task);
         Set_Archive_Status_Done(0, "Failed to start archive");
         return 0;
@@ -392,12 +404,13 @@ static void Set_Preview_Status_Done(int ok, const char* message) {
 static gpointer Preview_Media_Thread(gpointer user_data) {
     PreviewTask* task = (PreviewTask*)user_data;
     if (!task) {
+        ACAP_Background_Job_End();
         return NULL;
     }
 
     LOG("%s: start profile=%s fps=%d\n", __func__, task->profile_id, task->fps);
     char out_path[PATH_MAX_LEN];
-    int ok = media_generate_preview(task->profile_id, task->fps, out_path, sizeof(out_path));
+    int ok = media_generate_preview(task->profile_id, task->fps, out_path, sizeof(out_path), 1);
     if (ok) {
         LOG("%s: done profile=%s\n", __func__, task->profile_id);
         Set_Preview_Status_Done(1, "Preview ready");
@@ -407,6 +420,7 @@ static gpointer Preview_Media_Thread(gpointer user_data) {
     }
 
     g_free(task);
+    ACAP_Background_Job_End();
     return NULL;
 }
 
@@ -428,8 +442,10 @@ static int Queue_Preview_Media(const char* profile_id, int fps) {
     task->fps = fps;
     Set_Preview_Status_Active(profile_id);
 
+    ACAP_Background_Job_Begin();
     GThread* thread = g_thread_new("preview-media", Preview_Media_Thread, task);
     if (!thread) {
+        ACAP_Background_Job_End();
         g_free(task);
         Set_Preview_Status_Done(0, "Failed to start preview");
         return 0;
@@ -1363,20 +1379,24 @@ static void HTTP_Endpoint_Export(const ACAP_HTTP_Response response,
 	LOG_TRACE("%s: %s fps=%d\n", __func__, profileId, fps );
 
     char output_path[PATH_MAX_LEN];
-    // Download always forces a full catch-up rather than relying on whatever the periodic
-    // sweep last flushed - quality/completeness over how long the click takes to resolve, per
-    // the deployment model this app is built for. The frontend already does this as a separate
-    // background PUT + poll before fetching, so this is normally an instant cache hit; forcing
-    // it here too makes a direct GET (no preceding PUT) behave correctly on its own.
-    if (!media_process_pending_force(profileId, fps)) {
-        int status = media_ffmpeg_available() ? 500 : 503;
-        LOG_WARN("%s: failed profile=%s fps=%d status=%d err=%s\n", __func__, profileId, fps, status, media_last_error());
-        ACAP_HTTP_Respond_Error(response, status, media_last_error());
+    if (!storage_export_path(output_path, sizeof(output_path), profileId, fps)) {
+        ACAP_HTTP_Respond_Error(response, 500, "Failed to build export path");
         return;
     }
 
-    if (!storage_export_path(output_path, sizeof(output_path), profileId, fps)) {
-        ACAP_HTTP_Respond_Error(response, 500, "Failed to build export path");
+    // The frontend always does a background PUT (forces a full catch-up) + poll before this
+    // GET, so the export is normally already exactly what's needed - just stream it. Only build
+    // synchronously here as a fallback for a direct GET with no preceding PUT (bookmark, API
+    // caller, old page). Deliberately NOT re-forcing a catch-up when the file already exists:
+    // doing so would chase whatever's been captured in the meantime, which is exactly the
+    // "images keep landing while the job runs" churn this avoids, per how this app's meant to
+    // be used - a click either prepares (PUT) or fetches (GET), never both in one request.
+    struct stat export_stat;
+    int export_exists = stat(output_path, &export_stat) == 0 && S_ISREG(export_stat.st_mode) && export_stat.st_size > 0;
+    if (!export_exists && !media_process_pending_force(profileId, fps)) {
+        int status = media_ffmpeg_available() ? 500 : 503;
+        LOG_WARN("%s: failed profile=%s fps=%d status=%d err=%s\n", __func__, profileId, fps, status, media_last_error());
+        ACAP_HTTP_Respond_Error(response, status, media_last_error());
         return;
     }
 
@@ -1422,8 +1442,14 @@ static void HTTP_Endpoint_Video(const ACAP_HTTP_Response response, const ACAP_HT
     LOG("%s: request profile=%s fps=%d\n", __func__, profileId, fps);
 
     // Never touches the permanent export cache - see media_generate_preview()'s own comment.
+    // Try fetch-only first: the frontend always does a background PUT + poll before this GET,
+    // so the preview is normally already exactly what that PUT built - serve it as-is rather
+    // than re-checking against a possibly-newer frame count (which is exactly the "images land
+    // while the job runs" churn this avoids). Only fall back to building here for a direct GET
+    // with no preceding PUT (bookmark, API caller, old page).
     char output_path[PATH_MAX_LEN];
-    if (!media_generate_preview(profileId, fps, output_path, sizeof(output_path))) {
+    if (!media_generate_preview(profileId, fps, output_path, sizeof(output_path), 0) &&
+        !media_generate_preview(profileId, fps, output_path, sizeof(output_path), 1)) {
         int status = media_ffmpeg_available() ? 500 : 503;
         LOG_WARN("%s: failed profile=%s fps=%d status=%d err=%s\n", __func__, profileId, fps, status, media_last_error());
         ACAP_HTTP_Respond_Error(response, status, media_last_error());
@@ -1748,6 +1774,7 @@ static gpointer process_chunks_thread(gpointer user_data) {
 
     LOG("%s: done processed=%d skipped=%d\n", __func__, processed, skipped);
     g_atomic_int_set(&chunk_sweep_running, 0);
+    ACAP_Background_Job_End();
     return NULL;
 }
 
@@ -1758,10 +1785,12 @@ static gpointer process_chunks_thread(gpointer user_data) {
 static gboolean process_chunks_hourly(gpointer user_data) {
     (void)user_data;
     if (g_atomic_int_compare_and_exchange(&chunk_sweep_running, 0, 1)) {
+        ACAP_Background_Job_Begin();
         GThread* thread = g_thread_new("chunk-sweep", process_chunks_thread, NULL);
         if (thread) {
             g_thread_unref(thread);
         } else {
+            ACAP_Background_Job_End();
             g_atomic_int_set(&chunk_sweep_running, 0);
             LOG_WARN("%s: failed to start background sweep thread\n", __func__);
         }

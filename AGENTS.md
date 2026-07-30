@@ -84,36 +84,64 @@ inline `<script>` block. Edit it directly; there's no bundler/transpiler in fron
    (`capture.c`, grabs one JPEG from vdo-stream) → `recording_store_capture_profile()`
    (`recording_store.c`) writes the JPEG to `<frames_dir>/00000123.jpg` and bumps the profile's
    cumulative counters (`frames`, `images`, `sizeBytes`, `size`, `last`, ...).
-2. **Encoding**: nothing encodes automatically in the background. A video only gets (re)built when
-   something asks for it — playing, downloading, refreshing, or archiving a recording all end up
-   calling into `media.c`'s `generate_mp4()`, which shells out to the bundled `ffmpeg` against the
-   raw JPEG sequence (`ffmpeg -framerate FPS -i frames/%08d.jpg ...`).
-3. **Incremental export**: the "export" video (used for live preview/download) is built
-   incrementally — only newly-captured frames get encoded in each pass, then concatenated
-   (stream-copy, no re-encode) onto the existing export MP4. Once a batch of raw JPEGs has been
-   folded in, **those JPEG files are deleted** (`delete_frame_range`) to save SD card space. See
-   "Traps" below — this purging has real consequences for anything that assumes raw frames are
-   still on disk.
+2. **Encoding into the permanent export cache** happens two ways: an hourly background sweep
+   (`process_chunks_hourly` in `recordings.c`, runs on its own `GThread`) checks every profile and
+   calls `media_process_pending()`, which only does real work once a profile has crossed
+   `INCREMENTAL_MIN_PENDING_FRAMES` (500) or gone quiet for `INCREMENTAL_QUIET_WINDOW_MS` (2h) - see
+   `should_process_incremental_update()` in `media.c`. The other trigger is an explicit Download
+   click, which calls `media_process_pending_force()` and bypasses that gating entirely (quality/
+   completeness over how long the click takes). Both funnel into `media.c`'s `generate_mp4()`,
+   which shells out to the bundled `ffmpeg` against the raw JPEG sequence
+   (`ffmpeg -framerate FPS -i frames/%08d.jpg ...`).
+3. **Incremental export**: each time it runs, only newly-captured frames get encoded, then
+   concatenated (stream-copy, no re-encode) onto the existing export MP4. Once a batch of raw
+   JPEGs has been folded in, **those JPEG files are deleted** (`delete_frame_range`) to save SD
+   card space. See "Traps" below — this purging has real consequences for anything that assumes
+   raw frames are still on disk. The 500-frame/quiet-window gating is deliberately sized close to
+   `EXPORT_GOP_FRAMES` so a batch boundary lands roughly where a periodic keyframe would anyway;
+   this is what bounds SD card usage during long unattended stretches without fragmenting the GOP
+   structure the way a small/eager threshold would.
 4. **Archive**: a full, single-pass encode of everything captured so far, written to a
    timestamped file in the archive directory; on success the live recording's raw media is
    cleared (`Recordings_Clear`). Unlike export, archive always fully re-encodes (no cache-hit
    short-circuit) — see `cache_is_valid()` in `media.c`, which explicitly forces `MEDIA_ARCHIVE`
-   to always regenerate.
-5. **Frontend** polls `GET recordings` / `GET archive` / `GET timelapse` to render the Recordings
-   table, and drives per-recording actions (Play, Download, Edit, Refresh, Archive, Reset, Delete)
-   via the HTTP endpoints below. Long-running media jobs report progress through a shared
-   `ACAP_STATUS` group called `"mediaJob"` (`active`/`stage`/`progress`/`estimatedSeconds`/
-   `message`), which the frontend polls via `GET status` while the triggering request is still in
-   flight (works because the ACAP HTTP server handles requests concurrently).
+   to always regenerate. Inside `generate_mp4()`, archive has its own prefix-merge fallback
+   (prepend the export cache when earlier raw frames have already been purged by export
+   processing) - this is the common case for a long-running recording, not an edge case.
+5. **Play** uses a completely separate, disposable preview (`media_generate_preview()`, despite the
+   name it no longer aliases export, and it does not go through `generate_mp4()` at all) — export
+   cache (or the previous preview, whichever covers more) plus a fast/cheap encode of whatever's
+   still pending, for viewing only. It never purges frames or updates the export's incremental
+   state, so it can be rebuilt on every single Play click with zero effect on the permanent
+   export's GOP quality. See "Traps" below for why the merge base is chosen dynamically instead of
+   always being the export cache.
+6. **Frontend** polls `GET recordings` / `GET archive` / `GET timelapse` to render the Recordings
+   table, and drives per-recording actions (Play, Download, Edit, Archive, Reset, Delete) via the
+   HTTP endpoints below. Long-running media jobs report progress through a shared `ACAP_STATUS`
+   group called `"mediaJob"` (`active`/`stage`/`progress`/`estimatedSeconds`/`message`), which the
+   frontend polls via `GET status`. This only works because the *actual* ffmpeg work for
+   Refresh/Archive/Preview runs on a background `GThread`, not because the HTTP server itself is
+   concurrent — see the first entry under "Traps" below, this got it backwards once already.
+7. **PUT prepares, GET only fetches - deliberately, never both in one request.** Play/Download
+   both work as PUT (queues the background job) → poll `GET status` → GET (fetches the result).
+   The GET side does **not** recompute against a possibly-newer frame count once something's
+   already cached (`media_generate_preview(..., allow_rebuild=0)` for video; a plain existence
+   check before `HTTP_Endpoint_Export` calls `media_process_pending_force()`) - it just serves
+   what the PUT already built, even if a capture landed in between. This is intentional: on a
+   fast-capturing profile, chasing the live count on every request meant the job could take
+   longer with every retry (see the disposable-preview trap below) and made Download slower than
+   necessary. A capture that lands mid-job is simply picked up by the *next* Play/Download click
+   (or the next periodic sweep), not the one in flight. GET still falls back to building
+   synchronously if nothing's cached yet at all (bookmark / direct API call with no preceding PUT).
 
 ## HTTP endpoints (all registered via `ACAP_HTTP_Node`, admin-only)
 
 | Node | Methods | File | Purpose |
 |---|---|---|---|
 | `timelapse` | GET/PUT/DELETE | timelapse.c | recording profile CRUD |
-| `recordings` | GET/PUT/DELETE | recordings.c | list recordings; `PUT` force-processes pending chunks into the export MP4 ("Refresh"); `DELETE` resets a recording's media |
-| `video` | GET | recordings.c | stream the live/preview MP4 inline (folds in pending frames first) |
-| `export` | GET | recordings.c | download the live recording as MP4 (timestamped filename) |
+| `recordings` | GET/PUT/DELETE | recordings.c | list recordings; `PUT` forces the export catch-up in the background (used internally by Download, no longer its own UI action); `DELETE` resets a recording's media |
+| `video` | GET/PUT | recordings.c | `PUT` queues the disposable preview in the background; `GET` streams it (builds it synchronously if needed) |
+| `export` | GET | recordings.c | download the live recording as MP4 (timestamped filename), always forces a full catch-up first |
 | `archive` | GET/PUT/DELETE | recordings.c | list archives; `PUT` archives a recording now; `DELETE` removes an archive |
 | `download` | GET | recordings.c | download/stream an existing archive file |
 | `migration` | GET/POST | migration.c | legacy AVI→MP4 migration status/control |
@@ -148,13 +176,64 @@ at the areas path, and some (older/other firmware) dual-mount it at both.
     cache/export_<fps>fps.mp4.json              metadata sidecar: frames/fps/last/sizeBytes/width/height
                                                   at the time this file was last (re)generated
     cache/export_<fps>fps.mp4.state.json        incremental state: finalizedFrames/fps for the export
-    cache/preview_<fps>fps.mp4                  (legacy path constant; current code routes preview
-                                                  through the export path instead, see media.c)
+    cache/preview_<fps>fps.mp4                  disposable Play preview (see media_generate_preview);
+                                                  never purges frames, never touches export's state
+    cache/preview_<fps>fps.mp4.frames           sidecar: how many frames this preview covers - a
+                                                  cache-hit shortcut only, not correctness-critical
   archive/<name>_<timestamp>.mp4                finalized archive videos
 ```
 
 ## Non-obvious things worth knowing before you touch `media.c` / `recordings.c`
 
+- **This app's HTTP handling is single-threaded — one FastCGI request at a time, full stop.**
+  `ACAP_HTTP_Process()` (`ACAP.c`) does `FCGX_Accept_r()` → dispatch → return, in a loop, on one
+  dedicated `pthread`. A handler that blocks on `generate_mp4()` blocks *every other request*,
+  including `GET status` polls the progress bar depends on. This was gotten backwards once
+  already (assumed "the ACAP HTTP server handles requests concurrently"). The fix used
+  throughout: do the real ffmpeg work on a `GThread` (`Queue_Refresh_Media`/`Queue_Archive_Media`/
+  `Queue_Preview_Media`/`process_chunks_thread` in `recordings.c`) and have the handler return
+  immediately; the frontend polls `GET status` and fetches the result once done. Any new handler
+  that might run `generate_mp4()`/`media_generate_preview()` for more than a fraction of a second
+  needs the same treatment, or it will stall the whole app for anyone else hitting it meanwhile.
+- **Every detached background `GThread` (there are 7: Reset/Refresh/Archive/Preview media,
+  the hourly chunk sweep, fps re-encode in `timelapse.c`, AVI migration) must bracket its work
+  with `ACAP_Background_Job_Begin()` / `ACAP_Background_Job_End()` (`ACAP.c`).** This is what
+  fixed a real, reproduced-twice `double free or corruption` SIGABRT on shutdown: `main.c`'s
+  `signal_handler` just calls `g_main_loop_quit()` on SIGTERM and then `ACAP_Cleanup()` frees
+  shared cJSON containers (`status_container` etc.) unconditionally - if a background thread was
+  still mid-write to one of those (e.g. `ACAP_STATUS_SetNumber("mediaJob", ...)`) when that
+  happened, the free and the write raced and corrupted the heap. `ACAP_Cleanup()` now stops HTTP
+  first (so no *new* job can be queued), then calls `ACAP_Background_Jobs_Wait()` (bounded at
+  30s) before freeing anything. If you add an 8th background thread, wire it into this same
+  Begin/End pattern or you've reopened the hole - for a function with multiple early returns,
+  wrap it in a trampoline (see `migration_thread_tracked`) rather than editing every return site.
+- **`media_generate_preview()`'s merge base is picked dynamically — export cache or the previous
+  preview, whichever covers more frames — specifically to avoid re-copying an ever-growing export
+  cache on every single rebuild.** Naively always merging against the export cache is a real bug
+  that shipped once: on an actively-capturing profile, a preview rebuild that takes long enough
+  for even one more frame to land invalidates the "already current" cache check, forcing another
+  rebuild — and if that rebuild always re-copies the *entire* export cache (which can be hundreds
+  of MB on a long-running recording) as its prefix, each retry takes longer than the last while
+  capture keeps happening, and it may never converge. Building on the previous preview instead
+  bounds each rebuild to the delta since the *last* rebuild, not since the export cache's last
+  checkpoint. If you touch this function, keep that dynamic base-selection — don't hardcode
+  `export_path` as the prefix again.
+- **`mediaJob.estimatedSeconds` comes from `estimate_encode_seconds()` (media.c), a rolling
+  average of *actually observed* encode+merge time per frame** (`record_encode_throughput()`,
+  updated after every real encode in `generate_mp4()` and `media_generate_preview()`), not a
+  fixed formula. An earlier version derived the estimate from playback fps
+  (`frame_count/fps * 0.35`), which has no relationship to real encode throughput at all - it was
+  wrong by 5-10x on this hardware (other ACAPs/analytics competing for CPU), which is what made
+  the progress bar rocket to its cap and then sit there for the rest of the job. If you add
+  another kind of job that reports progress, feed it frame counts through this same rolling
+  average rather than inventing a new estimate formula.
+- **A profile's daylight `conditions` value is a plain string match between the frontend and
+  `main.c` (`MAIN_Timelapse_Trigger`) - there's no shared enum/constant.** This already broke once:
+  the frontend stores `"dawn-dusk"` (hyphen, matches the `<option value="dawn-dusk">` in
+  `index.html`) but `main.c` checked `"dawn_dusk"` (underscore), so the condition never matched
+  and captures ran around the clock regardless of the setting - silently, no error anywhere. If
+  you add or touch a `conditions` value, grep both `index.html`'s option values and `main.c`'s
+  `strcmp` calls together; don't trust that they already agree.
 - **GOP is a fixed frame count (`EXPORT_GOP_FRAMES` in media.c), not fps-scaled.** It used to be
   `fps * 10` ("10 seconds of playback"), which sounds reasonable but is wrong here: frame *count*
   never changes with the fps setting (fps is purely playback speed for a fixed image sequence), so
@@ -175,10 +254,13 @@ at the areas path, and some (older/other firmware) dual-mount it at both.
   config vs. `recording_store`'s cached copy from the last capture), and they've drifted apart,
   you'll silently be looking at two different files. Always resolve fps once and thread it through.
 - **`generate_mp4()`'s `cache_is_valid()` treats `MEDIA_ARCHIVE` as always-invalid** — archives
-  always fully regenerate; only export/preview (`MEDIA_EXPORT`/`MEDIA_PREVIEW`) short-circuit on a
-  metadata match. If a "why didn't this re-encode" investigation involves an export/preview video,
-  check the metadata JSON sidecar (`<path>.mp4.json`) against the live `recording_store` counters
-  first — a stale/matching sidecar is a legitimate reason for `generate_mp4` to no-op.
+  always fully regenerate; `MEDIA_EXPORT` short-circuits on a metadata match. If a "why didn't
+  this re-encode" investigation involves an export video, check the metadata JSON sidecar
+  (`<path>.mp4.json`) against the live `recording_store` counters first — a stale/matching
+  sidecar is a legitimate reason for `generate_mp4` to no-op. Note `MEDIA_PREVIEW` is now dead
+  code inside `generate_mp4()` itself (kept for the enum/switch cases) - nothing calls
+  `generate_mp4()` with `kind=MEDIA_PREVIEW` any more, since `media_generate_preview()` has its
+  own separate, non-`generate_mp4()` implementation (see the disposable-preview trap above).
 - **Never call a `snprintf(out, len, "%s", src)`-style helper with `src == out`.** This bit the
   codebase twice (a filename-normalization helper self-aliased its in/out buffer, silently
   collapsing the string to empty under glibc). If you see a function taking both an output buffer
@@ -189,6 +271,13 @@ at the areas path, and some (older/other firmware) dual-mount it at both.
   in place by every capture). `recordings.c` has its own `Recordings_Container`, which is normally
   just an alias to the same object via `recording_store_list()` — but don't assume that always
   holds; check assignment sites if you're debugging staleness.
+- **`ArchiveList` (recordings.c) is guarded by a recursive `GRecMutex`** (`archive_list_mutex`) -
+  recursive because `Retention_Cleanup()` calls `Recordings_Delete_Archive()` while already
+  holding it. This wasn't paranoia: it was already being touched from two threads with zero
+  protection before the mutex was added (manual archive/delete actions on the http-thread vs.
+  automatic midnight archiving via `check_midnight` on the main GLib-loop thread). If you add a
+  new place that reads or writes `ArchiveList`, take the lock; don't assume single-threaded access
+  just because the existing code mostly looks that way at a glance.
 - Progress-reporting convention: anything that runs a real ffmpeg pass and might take a while
   should push status through `ACAP_STATUS_Set*("mediaJob", ...)` (see `set_media_encode_status_*`
   / `set_reencode_status_*` in media.c, `Set_Reset_Media_Status_*` in recordings.c) so the frontend

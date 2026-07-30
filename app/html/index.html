@@ -446,20 +446,41 @@ function declineMigration() {
 }
 
 function renderMediaJobProgress() {
-    const elapsedSec = Math.max(1, Math.floor((Date.now() - mediaJobClientStartMs) / 1000));
+    // estimatedSeconds is now a rolling average of this device's actual measured encode
+    // throughput (see estimate_encode_seconds() in media.c), so it's usually close - but
+    // "close" still means some jobs finish early and some run over. Rather than racing to a
+    // hard cap and then sitting there (which is what looked "stuck" before), this keeps
+    // creeping asymptotically toward 99% for as long as the job actually runs, so it always
+    // reads as "still working," never "frozen."
+    const elapsedSec = Math.max(0, (Date.now() - mediaJobClientStartMs) / 1000);
     let displayProgress = Math.max(1, mediaJobProgress);
 
     if (mediaJobEstimateSec > 0) {
-        displayProgress = Math.min(98, Math.max(displayProgress, (elapsedSec / mediaJobEstimateSec) * 100));
+        if (elapsedSec <= mediaJobEstimateSec) {
+            displayProgress = Math.max(displayProgress, (elapsedSec / mediaJobEstimateSec) * 90);
+        } else {
+            const overtimeSec = elapsedSec - mediaJobEstimateSec;
+            const timeConstant = Math.max(mediaJobEstimateSec, 5);
+            const crawl = 90 + 9 * (1 - Math.exp(-overtimeSec / timeConstant));
+            displayProgress = Math.max(displayProgress, crawl);
+        }
     } else {
-        // Fallback when no estimate is available yet: steadily advance, capped until completion.
-        displayProgress = Math.min(95, Math.max(displayProgress, 5 + (elapsedSec * 2)));
+        // No estimate yet (first render before the first status poll lands): steady, capped
+        // climb rather than jumping straight to a number that might be wildly wrong.
+        displayProgress = Math.max(displayProgress, Math.min(90, 5 + (elapsedSec * 2)));
     }
 
-    const percent = Math.min(100, Math.max(0, displayProgress));
+    const percent = Math.min(99, Math.max(0, displayProgress));
     const percentText = percent.toFixed(1);
     $('#busyModalText').text(mediaJobStage);
     $('#busyModalProgressBar').css('width', percent + '%').text(percentText + '%');
+}
+
+function setBusyProgress(stage, percent) {
+    const clamped = Math.min(100, Math.max(0, Number(percent || 0)));
+    const text = clamped.toFixed(1) + '%';
+    $('#busyModalText').text(stage || mediaJobStage || 'Processing');
+    $('#busyModalProgressBar').css('width', clamped + '%').text(text);
 }
 
 // Starts (or restarts) the 1s progress-bar render loop. Call before an action that will be
@@ -518,7 +539,7 @@ function waitForMediaJobDone(timeoutMs, onDone) {
                 }
                 done = true;
                 const message = media ? media.message : '';
-                const failed = !!media && Number(media.progress || 0) <= 0 && /fail|error/i.test(message || '');
+                const failed = !!media && Number(media.progress || 0) <= 0;
                 onDone(!failed, message);
             })
             .fail(function() {
@@ -978,6 +999,7 @@ function playRecording(id) {
     mediaJobStage = 'Preparing video';
     runBackgroundJobThen('video?id=' + encodeURIComponent(id) + '&fps=' + encodeURIComponent(fps), function() {
         mediaJobStage = 'Loading video';
+        setBusyProgress('Loading video stream...', 99);
 
         let settled = false;
         let timeoutId = null;
@@ -1012,11 +1034,13 @@ function playRecording(id) {
         video.oncanplay = onReady;
         video.onerror = onError;
 
-        // The PUT above already built/refreshed the disposable preview, so this is now
-        // expected to be a fast fetch - 30s is generous, not a wait for the tail encode.
+        // The PUT above already built/refreshed the disposable preview, so this is normally a
+        // fast fetch - but on an actively-capturing profile a frame or two can still land
+        // between the PUT finishing and this GET starting, forcing a small delta re-encode.
+        // 60s covers that plus a loaded-CPU margin without masking a genuine failure for long.
         timeoutId = setTimeout(function() {
             onError();
-        }, 30000);
+        }, 60000);
 
         video.currentTime = 0;
         video.src = 'video?id=' + encodeURIComponent(id) + '&fps=' + encodeURIComponent(fps) + '&_=' + Date.now();
@@ -1076,6 +1100,7 @@ function exportRecording(id) {
     showBusy('Preparing export...');
     mediaJobStage = 'Preparing export...';
     runBackgroundJobThen('recordings?id=' + encodeURIComponent(id), function() {
+        setBusyProgress('Starting download...', 99);
         hideBusy();
         const form = document.createElement('form');
         form.method = 'GET';

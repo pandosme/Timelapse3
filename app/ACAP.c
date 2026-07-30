@@ -2413,13 +2413,48 @@ ACAP_VAPIX_Init() {
 }
 
 /*------------------------------------------------------------------
+ * Background job tracking (see ACAP.h for why this exists)
+ *------------------------------------------------------------------*/
+
+static gint acap_background_jobs = 0;
+
+void ACAP_Background_Job_Begin(void) {
+    g_atomic_int_inc(&acap_background_jobs);
+}
+
+void ACAP_Background_Job_End(void) {
+    g_atomic_int_add(&acap_background_jobs, -1);
+}
+
+void ACAP_Background_Jobs_Wait(int timeout_ms) {
+    long long waited_ms = 0;
+    const int step_ms = 100;
+    while (g_atomic_int_get(&acap_background_jobs) > 0 && waited_ms < timeout_ms) {
+        g_usleep(step_ms * 1000);
+        waited_ms += step_ms;
+    }
+    if (g_atomic_int_get(&acap_background_jobs) > 0) {
+        LOG_WARN("%s: %d background job(s) still running after %dms, proceeding with cleanup anyway\n",
+                  __func__, g_atomic_int_get(&acap_background_jobs), timeout_ms);
+    }
+}
+
+/*------------------------------------------------------------------
  * Cleanup Implementation
  *------------------------------------------------------------------*/
 
 void ACAP_Cleanup(void) {
-    // Clean up other resources
+    // Stop accepting new HTTP requests first, so nothing can queue a new background job (e.g.
+    // via a PUT that spawns a GThread) during the wait below - only then can "wait for jobs
+    // still running" actually reach zero and stay there.
     ACAP_HTTP_Cleanup();
-	
+
+    // Let any in-flight background media job (Refresh/Archive/Preview/Reset/reencode/migration
+    // thread) finish before freeing the shared state below (e.g. status_container) it writes to
+    // - otherwise a job still running at shutdown can write to memory this function is about to
+    // free, corrupting the heap. Bounded so a stuck job can't hang shutdown forever.
+    ACAP_Background_Jobs_Wait(30000);
+
     if (status_container) {
         cJSON_Delete(status_container);
         status_container = NULL;

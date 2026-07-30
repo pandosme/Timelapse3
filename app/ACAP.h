@@ -61,6 +61,17 @@ int 		ACAP_Set_Config(const char* service, cJSON* serviceSettings);
 cJSON* 		ACAP_Get_Config(const char* service);
 void		ACAP_Cleanup(void);
 
+// Tracks detached background GThreads (Reset/Refresh/Archive/Preview media jobs, the hourly
+// chunk sweep, fps re-encode, AVI migration - anything spawned "fire and forget" via
+// g_thread_new()+g_thread_unref() that touches shared state like ACAP_STATUS's containers).
+// Call _Begin() right before spawning such a thread and _End() as the very last thing the
+// thread body does before returning. main() waits on this before ACAP_Cleanup() frees that
+// shared state, so a background job can't be mid-write when its target gets deleted out from
+// under it - see AGENTS.md for the crash this fixes.
+void		ACAP_Background_Job_Begin(void);
+void		ACAP_Background_Job_End(void);
+void		ACAP_Background_Jobs_Wait(int timeout_ms);
+
 /*-----------------------------------------------------
  * HTTP Functions
  *-----------------------------------------------------*/

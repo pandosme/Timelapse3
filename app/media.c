@@ -1,3 +1,4 @@
+#include "ACAP.h"
 #include <dirent.h>
 #include <errno.h>
 #include <glib.h>
@@ -14,7 +15,6 @@
 #include "media.h"
 #include "recording_store.h"
 #include "storage.h"
-#include "ACAP.h"
 
 #define LOG(fmt, args...) { syslog(LOG_INFO, fmt, ## args); printf(fmt, ## args); }
 #define LOG_WARN(fmt, args...) { syslog(LOG_WARNING, fmt, ## args); printf(fmt, ## args); }
@@ -100,6 +100,32 @@ static int clamp_fps(int fps) {
     return fps;
 }
 
+// Rolling average of real, observed encode+merge throughput (ms per frame), used to estimate
+// "estimatedSeconds" for the mediaJob progress bar. This device's actual throughput varies a lot
+// with what else is running (analytics, streaming, other ACAPs) - a fixed formula based on
+// playback fps was frequently wrong by 5-10x, which is what made the progress bar rocket to its
+// cap and then sit there for the rest of the job. Seeded with a conservative guess; every real
+// job updates it, so the estimate self-corrects to this specific device's real-world behavior.
+static double avg_encode_ms_per_frame = 150.0;
+
+static void record_encode_throughput(int frame_count, long long elapsed_ms) {
+    if (frame_count < 1 || elapsed_ms < 1) {
+        return;
+    }
+    double sample_ms_per_frame = (double)elapsed_ms / (double)frame_count;
+    // Exponential moving average: recent runs matter more than history, but one unusually
+    // fast/slow job shouldn't swing the next estimate wildly either.
+    avg_encode_ms_per_frame = (avg_encode_ms_per_frame * 0.7) + (sample_ms_per_frame * 0.3);
+}
+
+static double estimate_encode_seconds(int frame_count) {
+    if (frame_count < 1) {
+        return 2.0;
+    }
+    double estimate = (avg_encode_ms_per_frame * (double)frame_count) / 1000.0;
+    return estimate < 1.0 ? 1.0 : estimate;
+}
+
 // Decides whether a batch smaller than INCREMENTAL_MIN_PENDING_FRAMES is still worth flushing
 // now. Answer: only once capture has gone quiet for a while - if it's still actively capturing,
 // waiting produces a better (larger, more GOP-aligned) batch; once quiet, there's nothing to be
@@ -153,14 +179,7 @@ static void set_reencode_status_done(int ok, const char* message) {
 
 static void set_media_encode_status_active(const char* stage, const char* profile_id, int fps, int frame_count) {
     long long now = time(NULL);
-    double estimate_seconds = 2.0;
-    if (fps > 0 && frame_count > 0) {
-        // Conservative estimate for JPEG->H264 preview encoding.
-        estimate_seconds = ((double)frame_count / (double)fps) * 0.35 + 1.0;
-        if (estimate_seconds < 2.0) {
-            estimate_seconds = 2.0;
-        }
-    }
+    double estimate_seconds = estimate_encode_seconds(frame_count);
 
     ACAP_STATUS_SetBool("mediaJob", "active", 1);
     ACAP_STATUS_SetString("mediaJob", "kind", "media_encode");
@@ -1123,8 +1142,10 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
     last_error[0] = '\0';
     struct stat st;
     long long output_size = (stat(output_path, &st) == 0) ? (long long)st.st_size : -1;
+    long long total_elapsed_ms = monotonic_ms() - started_ms;
+    record_encode_throughput(frame_count, total_elapsed_ms);
     LOG("%s: success kind=%s profile=%s output=%s size=%lld elapsed_ms=%lld\n",
-        __func__, media_kind_name(kind), profile_id, output_path, output_size, monotonic_ms() - started_ms);
+        __func__, media_kind_name(kind), profile_id, output_path, output_size, total_elapsed_ms);
     if (media_job) {
         set_media_encode_status_done(1, kind == MEDIA_PREVIEW ? "Preview ready" :
             (kind == MEDIA_ARCHIVE ? "Archive ready" : "Recording video updated"));
@@ -1140,7 +1161,8 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
 // with zero lasting effect. That's deliberate: the permanent export cache's GOP quality must
 // only ever be touched by the periodic sweep or an explicit Download (both use generate_mp4()'s
 // proper -g/-sc_threshold-tuned encode), never by how many times someone clicks Play.
-int media_generate_preview(const char* profile_id, int fps, char* out_path, size_t out_len) {
+int media_generate_preview(const char* profile_id, int fps, char* out_path, size_t out_len, int allow_rebuild) {
+    long long preview_started_ms = monotonic_ms();
     if (!media_ffmpeg_available()) {
         set_last_error("ffmpeg not available for %s", profile_id);
         return 0;
@@ -1190,26 +1212,59 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
         return 1;
     }
 
-    // A previous call already built a preview covering everything captured so far - reuse it
-    // instead of redoing the tail encode. This is what makes a "prepare, then fetch" two-step
-    // Play flow (or repeated Play clicks with nothing new captured) cheap.
+    // How much does a previously-built preview already cover? Read this regardless of whether
+    // it's fully current - it's also used below to decide the merge base, not just the
+    // exact-match fast path.
     char preview_meta_path[1200];
     int preview_meta_written = snprintf(preview_meta_path, sizeof(preview_meta_path), "%s.frames", preview_path);
     int have_preview_meta = preview_meta_written > 0 && (size_t)preview_meta_written < sizeof(preview_meta_path);
-    if (have_preview_meta && file_exists_nonempty(preview_path)) {
+    int have_preview_file = have_preview_meta && file_exists_nonempty(preview_path);
+    int preview_frames = 0;
+    if (have_preview_file) {
         FILE* meta_file = fopen(preview_meta_path, "r");
         if (meta_file) {
-            int preview_frames = 0;
-            int matched = fscanf(meta_file, "%d", &preview_frames) == 1 && preview_frames == snapshot.frames;
-            fclose(meta_file);
-            if (matched) {
-                if (snprintf(out_path, out_len, "%s", preview_path) <= 0 || strlen(preview_path) >= out_len) {
-                    set_last_error("Failed to return preview path for %s", profile_id);
-                    return 0;
-                }
-                return 1;
+            char preview_frames_text[32];
+            if (fgets(preview_frames_text, sizeof(preview_frames_text), meta_file)) {
+                preview_frames = atoi(preview_frames_text);
             }
+            fclose(meta_file);
         }
+    }
+
+    // Already fully current - reuse it instead of redoing the tail encode. This is what makes
+    // a "prepare, then fetch" two-step Play flow (or repeated Play clicks with nothing new
+    // captured) cheap.
+    if (have_preview_file && snapshot.frames <= preview_frames) {
+        if (snprintf(out_path, out_len, "%s", preview_path) <= 0 || strlen(preview_path) >= out_len) {
+            set_last_error("Failed to return preview path for %s", profile_id);
+            return 0;
+        }
+        return 1;
+    }
+
+    // Build on whichever of the export cache or the last-built preview already covers more.
+    // This is what keeps repeated rebuilds cheap on an actively-capturing profile: each one
+    // only needs to encode+merge the delta since the LAST rebuild (of either kind), instead of
+    // re-copying the entire, ever-growing export cache from scratch every single time - which
+    // is what previously made this take longer with every retry, on a profile that captures
+    // faster than the rebuild + copy could complete.
+    const char* base_path = NULL;
+    int base_frames = 0;
+    if (have_export && encoded_frames >= preview_frames) {
+        base_path = export_path;
+        base_frames = encoded_frames;
+    } else if (have_preview_file) {
+        base_path = preview_path;
+        base_frames = preview_frames;
+    }
+
+    // Caller only wants whatever's already cached (typically a GET right after a PUT already
+    // built/refreshed it) - report "not ready" rather than doing new work here. This is what
+    // makes a fetch-only call immune to frames landing between the PUT finishing and this call:
+    // it either serves what's already there or says so, it never chases a newer count itself.
+    if (!allow_rebuild) {
+        set_last_error("Preview not ready for %s", profile_id);
+        return 0;
     }
 
     if (!g_mutex_trylock(&encode_mutex)) {
@@ -1232,8 +1287,8 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
         return 0;
     }
 
-    int start_number = encoded_frames + 1;
-    int frame_count = snapshot.frames - encoded_frames;
+    int start_number = base_frames + 1;
+    int frame_count = snapshot.frames - base_frames;
 
     // Frame files can start at a higher index than expected if older chunks were already
     // purged by a real export/archive pass; fall back to whatever's actually still on disk.
@@ -1325,10 +1380,10 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
     g_free(stderr_text);
     LOG("%s: tail encode done profile=%s elapsed_ms=%lld\n", __func__, profile_id, monotonic_ms() - tail_started_ms);
 
-    unlink(preview_path);
-
-    if (!have_export) {
-        // No export cache yet - the tail is the whole preview.
+    if (!base_path) {
+        // No base to build on yet (first-ever preview for this profile) - the tail is the
+        // whole preview.
+        unlink(preview_path);
         if (rename(tail_path, preview_path) == -1) {
             set_last_error("Failed to finalize preview: %s", strerror(errno));
             unlink(tail_path);
@@ -1336,11 +1391,23 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
             return 0;
         }
     } else {
-        // Prepend the export cache (stream copy, cheap) ahead of the fresh tail.
+        // Prepend the base (stream copy, cheap) ahead of the fresh tail. This writes to a
+        // separate temp file rather than preview_path directly, because base_path may *be*
+        // preview_path (see the base_path selection above) - ffmpeg must finish reading it
+        // before anything touches the real preview_path.
         char concat_list_path[1200];
         written = snprintf(concat_list_path, sizeof(concat_list_path), "%s.concat.txt", preview_path);
         if (written <= 0 || (size_t)written >= sizeof(concat_list_path)) {
             set_last_error("Preview concat path is too long for %s", profile_id);
+            unlink(tail_path);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
+
+        char concat_output_path[1200];
+        written = snprintf(concat_output_path, sizeof(concat_output_path), "%s.merge.tmp", preview_path);
+        if (written <= 0 || (size_t)written >= sizeof(concat_output_path)) {
+            set_last_error("Preview merge path is too long for %s", profile_id);
             unlink(tail_path);
             g_mutex_unlock(&encode_mutex);
             return 0;
@@ -1353,10 +1420,11 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
             g_mutex_unlock(&encode_mutex);
             return 0;
         }
-        fprintf(concat_list, "file '%s'\n", export_path);
+        fprintf(concat_list, "file '%s'\n", base_path);
         fprintf(concat_list, "file '%s'\n", tail_path);
         fclose(concat_list);
 
+        unlink(concat_output_path);
         char* concat_argv[] = {
             (char*)ffmpeg_exec,
             "-y",
@@ -1375,7 +1443,7 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
             "+faststart",
             "-f",
             "mp4",
-            preview_path,
+            concat_output_path,
             NULL
         };
 
@@ -1393,7 +1461,7 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
                 g_error_free(concat_error);
             }
             g_free(concat_stderr);
-            unlink(preview_path);
+            unlink(concat_output_path);
             g_mutex_unlock(&encode_mutex);
             return 0;
         }
@@ -1401,6 +1469,15 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
             g_error_free(concat_error);
         }
         g_free(concat_stderr);
+
+        // Only now safe to replace the real preview_path - ffmpeg has finished reading
+        // base_path, even in the case where that was the old preview_path itself.
+        if (rename(concat_output_path, preview_path) == -1) {
+            set_last_error("Failed to finalize merged preview: %s", strerror(errno));
+            unlink(concat_output_path);
+            g_mutex_unlock(&encode_mutex);
+            return 0;
+        }
     }
 
     g_mutex_unlock(&encode_mutex);
@@ -1414,6 +1491,8 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
             fclose(meta_file);
         }
     }
+
+    record_encode_throughput(frame_count, monotonic_ms() - preview_started_ms);
 
     if (snprintf(out_path, out_len, "%s", preview_path) <= 0 || strlen(preview_path) >= out_len) {
         set_last_error("Failed to return preview path for %s", profile_id);

@@ -803,6 +803,15 @@ static gpointer migration_thread(gpointer user_data) {
     return NULL;
 }
 
+// migration_thread() has several early-return paths; rather than touch each one, this
+// trampoline guarantees ACAP_Background_Job_End() fires exactly once whenever it returns,
+// by any path. See ACAP.h for why every detached background thread needs this.
+static gpointer migration_thread_tracked(gpointer user_data) {
+    gpointer result = migration_thread(user_data);
+    ACAP_Background_Job_End();
+    return result;
+}
+
 static void http_migration(const ACAP_HTTP_Response response, const ACAP_HTTP_Request request) {
     const char* method = ACAP_HTTP_Get_Method(request);
     if (!method) {
@@ -869,8 +878,10 @@ static void http_migration(const ACAP_HTTP_Response response, const ACAP_HTTP_Re
         save_state();
         g_mutex_unlock(&migration_mutex);
 
-        GThread* thread = g_thread_new("avi-migration", migration_thread, NULL);
+        ACAP_Background_Job_Begin();
+        GThread* thread = g_thread_new("avi-migration", migration_thread_tracked, NULL);
         if (!thread) {
+            ACAP_Background_Job_End();
             g_mutex_lock(&migration_mutex);
             set_state_string("status", "failed");
             set_state_string("message", "Unable to start migration worker.");

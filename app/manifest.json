@@ -8,10 +8,9 @@
             "vendorId": "6d8351dbbe",
             "vendorUrl": "https://pandosme.github.io",
             "runMode": "respawn",
-            "version": "3.0.3",
+            "version": "3.0.4",
             "compatibleOsVersions": [
                 {
-                    "min": "12",
                     "max": "13"
                 }
             ]

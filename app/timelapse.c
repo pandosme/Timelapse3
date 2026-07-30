@@ -37,6 +37,7 @@ typedef struct {
 static gpointer Reencode_Export_Thread(gpointer user_data) {
     ReencodeTask* task = (ReencodeTask*)user_data;
     if (!task) {
+        ACAP_Background_Job_End();
         return NULL;
     }
 
@@ -48,6 +49,7 @@ static gpointer Reencode_Export_Thread(gpointer user_data) {
     }
 
     g_free(task);
+    ACAP_Background_Job_End();
     return NULL;
 }
 
@@ -66,8 +68,10 @@ static void Queue_Reencode_Export(const char* profile_id, int old_fps, int new_f
     task->old_fps = old_fps;
     task->new_fps = new_fps;
 
+    ACAP_Background_Job_Begin();
     GThread* thread = g_thread_new("reencode", Reencode_Export_Thread, task);
     if (!thread) {
+        ACAP_Background_Job_End();
         LOG_WARN("%s: failed to create re-encode thread for %s\n", __func__, profile_id);
         g_free(task);
         return;

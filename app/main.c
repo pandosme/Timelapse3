@@ -42,12 +42,12 @@ void MAIN_Timelapse_Trigger(cJSON* profile) {
               __func__, SunEvents_Between_Dawn_Dusk(), SunEvents_Between_Sunrise_Sunset(), conditions ? conditions : "None");
 
 	if (conditions) {
-		if (strcmp(conditions, "dawn_dusk") == 0 && SunEvents_Between_Dawn_Dusk() == 0 ) {
-			LOG_TRACE("%s: Condition 'dawn_dusk' not met\n", __func__);
+		if (strcmp(conditions, "dawn-dusk") == 0 && SunEvents_Between_Dawn_Dusk() == 0 ) {
+			LOG_TRACE("%s: Condition 'dawn-dusk' not met\n", __func__);
 			return;
 		}
 		if (strcmp(conditions, "sunrise-sunset") == 0 && SunEvents_Between_Sunrise_Sunset() == 0 ) {
-			LOG_TRACE("%s: Condition 'sunrise_sunset' not met\n", __func__);
+			LOG_TRACE("%s: Condition 'sunrise-sunset' not met\n", __func__);
 			return;
 		}
 	}
