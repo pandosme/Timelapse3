@@ -380,6 +380,44 @@ static int Queue_Archive_Media(const char* profile_id) {
     return 1;
 }
 
+// Dedicated path for the automatic midnight sweep (see check_midnight below). Unlike
+// Queue_Archive_Media (one HTTP-triggered profile per call), this walks every due profile
+// sequentially inside a single background thread, so multiple profiles archiving on the same
+// night don't spawn concurrent threads that fight each other for encode_mutex. It also retries
+// on "already running" - generate_mp4()'s encode_mutex is a non-blocking trylock, so a collision
+// with the hourly chunk-sweep or a user-triggered Refresh/Preview/Export would otherwise make
+// Recordings_Archive() fail instantly with no retry, silently skipping that profile's archive
+// for a full 24h (recording_due_for_archive() has no memory of a prior failed attempt).
+static gpointer Midnight_Archive_Thread(gpointer user_data) {
+    GPtrArray* profile_ids = (GPtrArray*)user_data;
+    if (!profile_ids) {
+        ACAP_Background_Job_End();
+        return NULL;
+    }
+
+    for (guint i = 0; i < profile_ids->len; i++) {
+        const char* profile_id = (const char*)g_ptr_array_index(profile_ids, i);
+        int result = -1;
+        for (int attempt = 0; attempt < 5; attempt++) {
+            result = Recordings_Archive(profile_id);
+            if (result == 0 || !strstr(media_last_error(), "already running")) {
+                break;
+            }
+            LOG_WARN("%s: encode busy, retrying profile=%s attempt=%d\n", __func__, profile_id, attempt + 1);
+            g_usleep(2 * G_USEC_PER_SEC);
+        }
+        if (result == 0) {
+            LOG("%s: archived profile=%s\n", __func__, profile_id);
+        } else {
+            LOG_WARN("%s: giving up on midnight archive profile=%s err=%s\n", __func__, profile_id, media_last_error());
+        }
+    }
+
+    g_ptr_array_free(profile_ids, TRUE);
+    ACAP_Background_Job_End();
+    return NULL;
+}
+
 typedef struct {
     char profile_id[128];
     int fps;
@@ -1709,21 +1747,31 @@ LOG_TRACE("Midnight check: %d:%d", hour, minute);
 	did_trigger_today = true;
 
     LOG_TRACE("Archive duration check");
-    cJSON* list = cJSON_CreateArray();
+    GPtrArray* due_profile_ids = g_ptr_array_new_with_free_func(g_free);
     cJSON *recording = Recordings_Container ? Recordings_Container->child : NULL;
     while(recording) {
         if (recording_due_for_archive(recording->string, recording, now)) {
-            cJSON_AddItemToArray(list,cJSON_CreateString(recording->string));
+            g_ptr_array_add(due_profile_ids, g_strdup(recording->string));
         }
         recording = recording->next;
     }
-    cJSON* profile = list ? list->child : NULL;
-    while(profile) {
-        LOG_TRACE("Archiving: %s", profile->valuestring);
-        Recordings_Archive(profile->valuestring);
-        profile = profile->next;
+    if (due_profile_ids->len > 0) {
+        // Archiving runs ffmpeg and can take minutes for a busy profile; doing this inline
+        // here would stall every timer/event capture trigger on this thread (the GLib main
+        // context) for the duration, same reasoning as the other Refresh/Archive/Preview jobs
+        // already backgrounded elsewhere in this file.
+        ACAP_Background_Job_Begin();
+        GThread* thread = g_thread_new("midnight-archive", Midnight_Archive_Thread, due_profile_ids);
+        if (!thread) {
+            LOG_WARN("%s: failed to start midnight archive thread\n", __func__);
+            ACAP_Background_Job_End();
+            g_ptr_array_free(due_profile_ids, TRUE);
+        } else {
+            g_thread_unref(thread);
+        }
+    } else {
+        g_ptr_array_free(due_profile_ids, TRUE);
     }
-    cJSON_Delete(list);
 	Retention_Cleanup();
     g_date_time_unref(now);
 	LOG_TRACE("%s: Exit",__func__);

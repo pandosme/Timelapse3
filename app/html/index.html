@@ -285,9 +285,17 @@ function hideModal(id) {
     bootstrap.Modal.getOrCreateInstance(document.getElementById(id)).hide();
 }
 
-function showBusy(message) {
+// indeterminate: true for waits with no real percentage to report (e.g. the browser buffering
+// an already-finalized archive file - there's no background job to poll here, so a 0%-wide bar
+// left untouched just looks dead; a full-width bar shows the existing striped/animated CSS
+// instead of claiming a specific progress number we don't actually have).
+function showBusy(message, indeterminate) {
     $('#busyModalText').text(message || 'Please wait...');
-    $('#busyModalProgressBar').css('width', '0%').text('0%');
+    if (indeterminate) {
+        $('#busyModalProgressBar').css('width', '100%').text('');
+    } else {
+        $('#busyModalProgressBar').css('width', '0%').text('0%');
+    }
     showModal('busyModal');
 }
 
@@ -1052,7 +1060,9 @@ function playArchive(filename) {
     const video = document.getElementById('playVideo');
     video.pause();
 
-    showBusy('Loading archive');
+    // Archives are already-finalized files - there's no background job to poll, just the
+    // browser fetching/buffering, so this has no real percentage to report.
+    showBusy('Loading archive', true);
 
     let settled = false;
     let timeoutId = null;
