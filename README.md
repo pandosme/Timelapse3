@@ -32,9 +32,9 @@ Migration from TimelapseMe is not supported because TimelapseMe and Timelapse3 a
 
 ---
 
-## What's New in 3.0.0
+## What's New in 3.1.0
 
-Version 3.0.0 is a major update focused on easier operation, MP4 video, and safer upgrades from Timelapse 2.x.
+Version 3.1.0 is a major update focused on easier operation, MP4 video, and safer upgrades from Timelapse 2.x.
 
 ### MP4 Instead of AVI
 
@@ -86,7 +86,7 @@ Version 3.0.0 is a major update focused on easier operation, MP4 video, and safe
 
 ## Upgrading From Timelapse 2.x
 
-Timelapse 2.x used AVI recordings. Version 3.0.0 uses MP4.
+Timelapse 2.x used AVI recordings. Version 3.1.0 uses MP4.
 
 When old AVI recordings are found, Timelapse3 shows an **AVI migration required** dialog before normal operation starts.
 
@@ -113,7 +113,7 @@ Cancelling does not downgrade the app automatically. It keeps the old files inta
 
 ### Ongoing Recordings From 2.x
 
-If possible, an ongoing recording from Timelapse 2.x is imported as the live recording base for version 3.0.0 instead of being shown as an archive. This lets the recording continue in the new MP4 workflow.
+If possible, an ongoing recording from Timelapse 2.x is imported as the live recording base for version 3.1.0 instead of being shown as an archive. This lets the recording continue in the new MP4 workflow.
 
 Completed old AVI archives are converted to MP4 archives.
 
@@ -122,7 +122,7 @@ Completed old AVI archives are converted to MP4 archives.
 For cameras with important long-running recordings:
 
 1. Back up the camera SD card storage before upgrading.
-2. Install Timelapse3 3.0.0.
+2. Install Timelapse3 3.1.0.
 3. Open the app from the camera web interface.
 4. If prompted, run the AVI migration.
 5. Verify that live recordings and archives are visible.
@@ -247,7 +247,7 @@ The About page shows:
 
 - Use an SD card suitable for the expected retention period and image rate.
 - Test migration on one representative camera before upgrading a large fleet.
-- For important legacy installations, back up `/var/spool/storage/SD_DISK/timelapse2` before installing 3.0.0.
+- For important legacy installations, back up `/var/spool/storage/SD_DISK/timelapse2` before installing 3.1.0.
 - If the camera has many old AVI recordings, migration can take time.
 - The app shows progress during migration and media processing.
 
@@ -255,7 +255,7 @@ The About page shows:
 
 ## History
 
-### 3.0.0 - July 24, 2026
+### 3.1.0 - July 24, 2026
 
 - Changed recording output from AVI to MP4/H.264.
 - Added browser playback for live recordings.
