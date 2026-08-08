@@ -261,7 +261,7 @@ The About page shows:
 ## History
 
 ### 3.1.0 - July 24, 2026
-
+Main changes from Timelapse Version 2.x:  
 - Changed recording output from AVI to MP4/H.264.
 - Added browser playback for live recordings.
 - Added browser playback for archived recordings.
@@ -283,49 +283,3 @@ The About page shows:
 - Improved navigation and overall user interface.
 - Kept package name `timelapse2` for upgrade compatibility.
 
-### 1.1.3 - June 17, 2026
-
-- Fixed error "Failed to read Archive".
-- Fixed stability issues.
-
-### 1.1.2 - September 30, 2025
-
-- Fixed a bug that prevented automatic archive on daily, weekly, or monthly cadence.
-
-### 1.1.0 - September 27, 2025
-
-- Added automatic archive daily, weekly, or monthly.
-- Fixed removal of archived recordings after the retention period.
-- Adjusted the user interface.
-- Added SD card initialization information at startup.
-
-### 1.0.6 - September 18, 2025
-
-- Added alternative SD card check.
-- Added support for selecting any camera-supported resolution.
-
-### 1.0.5 - February 14, 2025
-
-- Fixed resolution selection for multi-sensor cameras.
-
-### 1.0.4 - December 14, 2025
-
-- Fixed sun recalculation.
-
-### 1.0.3 - December 5, 2025
-
-- Fixed Sun Noon event trigger.
-
-### 1.0.2 - December 2, 2025
-
-- Fixed playback after archiving a recording.
-- Fixed Sun Noon event handling.
-- Fixed captures so they only trigger on transition to active for stateful events.
-
-### 1.0.1 - December 26, 2024
-
-- Bug fixes.
-
-### 1.0.0 - December 25, 2024
-
-- Initial release.
