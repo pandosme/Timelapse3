@@ -10,9 +10,13 @@ Typical uses include:
 - Event trigger validation
 - Daily daylight snapshots, such as sun-noon progress images
 
-[Download ACAP (zip)](https://www.dropbox.com/scl/fi/uik3zu8potr7rv7u2djyb/Timelapse2.zip?rlkey=ovo9g8sb6qwmbyzptkn6c9674&dl=1)
+[Download Pre-Compiled ACAP (zip)](https://www.dropbox.com/scl/fi/7tmylmiza62oj597uxhfx/Timelapse3.zip?rlkey=zlfxfix394n3iivwit8qe2tdu&st=njmpa38n&dl=1)
 
-If you find this ACAP valuable, please consider [buying me a coffee](https://buymeacoffee.com/fredjuhlinl).
+## Support This Project
+
+If Timelapse V3 is useful to you, please consider supporting the project on **BuyMeACofee**:
+
+[Buy me a coffee](https://buymeacoffee.com/fredjuhlinl)
 
 Please report bugs and other issues [here](https://github.com/pandosme/Timelapse3/issues).
 
