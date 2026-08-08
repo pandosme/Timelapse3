@@ -1,4 +1,4 @@
-# AGENTS.md — Timelapse2
+# AGENTS.md — Timelapse3
 
 Guidance for LLM coding agents working in this repo. Read this before making changes; it covers
 things that are easy to get wrong from source alone (build environment, storage layout, and a
@@ -6,9 +6,12 @@ few non-obvious invariants discovered the hard way).
 
 ## What this is
 
-Timelapse2 is an AXIS camera app (ACAP — Axis Camera Application Platform) written in C. It
+Timelapse3 is an AXIS camera app (ACAP — Axis Camera Application Platform) written in C. It
 captures still JPEG frames on a schedule (or camera event), and assembles them into MP4/H.264
 timelapse videos directly on the camera, with a browser UI served from the camera itself.
+
+Legacy references to Timelapse 2.x and the `timelapse2` package/storage naming are intentional
+for upgrade and migration compatibility.
 
 Typical use cases: construction-site progress, long-term scene monitoring, forensic review,
 daily daylight snapshots (e.g. sun-noon shots). Capture intervals range from every few seconds
