@@ -21,8 +21,13 @@ Please report bugs and other issues [here](https://github.com/pandosme/Timelapse
 ## Requirements
 
 - Axis camera with AXIS OS 12 support.
+- aarch64 camera architecture.
 - SD card storage enabled on the camera.
 - Administrator access to install and configure the ACAP.
+
+Timelapse3 version 3.x supports aarch64 only.
+
+If your camera is armv7hf-based, stay on Timelapse2 version 2.x.
 
 Timelapse3 keeps package ID and binary name `timelapse2` on purpose so Timelapse2 users get an in-place upgrade path and recording migration.
 
