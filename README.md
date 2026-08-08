@@ -1,6 +1,6 @@
-# Timelapse3
+# Timelapse V3
 
-Timelapse3 creates MP4 timelapse videos directly on Axis cameras.
+Timelapse V3 creates MP4 timelapse videos directly on Axis cameras.
 
 Typical uses include:
 
@@ -25,15 +25,15 @@ Please report bugs and other issues [here](https://github.com/pandosme/Timelapse
 - SD card storage enabled on the camera.
 - Administrator access to install and configure the ACAP.
 
-Timelapse3 version 3.x supports aarch64 only.
+Timelapse V3 version 3.x supports aarch64 only.
 
 If your camera is armv7hf-based, stay on Timelapse2 version 2.x.
 
-Timelapse3 keeps package ID and binary name `timelapse2` on purpose so Timelapse2 users get an in-place upgrade path and recording migration.
+Timelapse V3 keeps package ID and binary name `timelapse2` on purpose so Timelapse2 users get an in-place upgrade path and recording migration.
 
-Because of this shared package identity, Timelapse2 and Timelapse3 cannot be installed side by side on the same camera.
+Because of this shared package identity, Timelapse2 and Timelapse V3 cannot be installed side by side on the same camera.
 
-Migration from TimelapseMe is not supported because TimelapseMe and Timelapse3 are different applications.
+Migration from TimelapseMe is not supported because TimelapseMe and Timelapse V3 are different applications.
 
 ---
 
@@ -93,7 +93,7 @@ Version 3.1.0 is a major update focused on easier operation, MP4 video, and safe
 
 Timelapse 2.x used AVI recordings. Version 3.1.0 uses MP4.
 
-When old AVI recordings are found, Timelapse3 shows an **AVI migration required** dialog before normal operation starts.
+When old AVI recordings are found, the ACAP shows an **AVI migration required** dialog before normal operation starts.
 
 ### Migration Choices
 
@@ -127,7 +127,7 @@ Completed old AVI archives are converted to MP4 archives.
 For cameras with important long-running recordings:
 
 1. Back up the camera SD card storage before upgrading.
-2. Install Timelapse3 3.1.0.
+2. Install Timelapse V3 3.1.0.
 3. Open the app from the camera web interface.
 4. If prompted, run the AVI migration.
 5. Verify that live recordings and archives are visible.
@@ -223,7 +223,7 @@ This helps reduce the risk of filling the SD card.
 
 ### Location and Sun Events
 
-Set the camera location so Timelapse3 can calculate:
+Set the camera location so Timelapse V3 can calculate:
 
 - Dawn
 - Sunrise
@@ -233,7 +233,7 @@ Set the camera location so Timelapse3 can calculate:
 
 These values can be used to limit captures to daylight hours.
 
-Timelapse3 can also fire a **Sun Noon** event, useful for consistent daily construction-site progress images.
+Timelapse V3 can also fire a **Sun Noon** event, useful for consistent daily construction-site progress images.
 
 ---
 
