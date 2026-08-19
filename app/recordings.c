@@ -128,8 +128,6 @@ struct AVIOLDINDEX_STRUCT {
 };
 typedef struct AVIOLDINDEX_STRUCT AVIOLDINDEX;
 
-static cJSON* Recordings_Container = NULL;
-
 static DWORD FOURCC(const char* str) {
     DWORD value = 0;
     value = str[3];
@@ -220,8 +218,6 @@ static void write_avi_header(FILE* f, DWORD frames, DWORD totalJPEGSize, DWORD w
 static size_t write_avi_frame(FILE* f, const unsigned char* data, size_t size);
 static int avi_add_index_entry(FILE* file, unsigned int frame, unsigned int jpeg_size);
 static void ensure_profile_directory(const char* profileId);
-static cJSON* load_recordings(void);
-static void save_recordings(void);
 int Recordings_Archive(const char *profileID);
 static void ensure_directory(const char *path);
 static void replace_spaces_with_underscores(char *str);
@@ -230,7 +226,7 @@ static void save_archive_list();
 static void update_avi_fps(FILE* f, unsigned int fps);
 int Recordings_Delete_Archive(const char* filename);
 
-static int stream_file_response(const ACAP_HTTP_Response response, const char* path, const char* content_type, const char* disposition, const char* filename);
+static int stream_file_response(const ACAP_HTTP_Response response, const ACAP_HTTP_Request request, const char* path, const char* content_type, const char* disposition, const char* filename);
 static void normalize_mp4_filename(char* out, size_t out_len, const char* filename);
 static void build_timestamped_export_filename(char* out, size_t out_len, const char* profile_name);
 
@@ -670,60 +666,6 @@ static void ensure_directory(const char *path) {
     }
 }
 
-static cJSON* load_recordings(void) {
-	//pthread_mutex_lock(&recordings_mutex);
-    char path[PATH_MAX_LEN];
-    if (!storage_recordings_path(path, sizeof(path))) {
-        return cJSON_CreateObject();
-    }
-
-    FILE* file = fopen(path, "r");
-    if (!file) {
-		//pthread_mutex_unlock(&recordings_mutex);
-        return cJSON_CreateObject();
-    }
-
-    fseek(file, 0, SEEK_END);
-    long size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-
-    char* json = malloc(size + 1);
-    if (!json) {
-        fclose(file);
-		//pthread_mutex_unlock(&recordings_mutex);
-        return cJSON_CreateObject();
-    }
-
-    fread(json, 1, size, file);
-    json[size] = 0;
-    fclose(file);
-
-    cJSON* recordings = cJSON_Parse(json);
-    free(json);
-	//pthread_mutex_unlock(&recordings_mutex);
-    return recordings ? recordings : cJSON_CreateObject();
-}
-
-static void save_recordings(void) {
-	LOG_TRACE("%s: Entry",__func__);
-	//pthread_mutex_lock(&recordings_mutex);
-    char path[PATH_MAX_LEN];
-    if (!storage_recordings_path(path, sizeof(path))) {
-        return;
-    }
-
-    char* json = cJSON_PrintUnformatted(Recordings_Container);
-    if (!json) return;
-
-    FILE* file = fopen(path, "w");
-    if (file) {
-        fwrite(json, strlen(json), 1, file);
-        fclose(file);
-    }
-    free(json);
-	//pthread_mutex_unlock(&recordings_mutex);
-}
-
 static int append_file(const char *source, const char *destination) {
     FILE *src = fopen(source, "rb");
     FILE *dest = fopen(destination, "rb+");  // Open in read/write mode
@@ -924,13 +866,16 @@ static int recording_due_for_archive(const char* profile_id, cJSON* recording, G
         return 0;
     }
 
-    cJSON* profile = Timelapse_Find_Profile_By_Id(profile_id);
+    cJSON* profile = Timelapse_Get_Profile(profile_id);
     if (!profile) {
         LOG_WARN("%s: No profile found for active recording %s\n", __func__, profile_id);
         return 0;
     }
 
-    const char* schedule = profile_archive_schedule(profile);
+    char schedule[32];
+    g_strlcpy(schedule, profile_archive_schedule(profile), sizeof(schedule));
+    cJSON_Delete(profile);
+
     if (strcmp(schedule, "none") == 0) {
         return 0;
     }
@@ -951,7 +896,6 @@ static int recording_due_for_archive(const char* profile_id, cJSON* recording, G
 
 int Recordings_Clear(const char* profileId) {
     int result = recording_store_clear(profileId);
-    Recordings_Container = recording_store_list();
     return result ? 0 : -1;
 }
 
@@ -1027,7 +971,60 @@ static void build_timestamped_export_filename(char* out, size_t out_len, const c
     normalize_mp4_filename(out, out_len, out);
 }
 
-static int stream_file_response(const ACAP_HTTP_Response response, const char* path, const char* content_type, const char* disposition, const char* filename) {
+/* Ranges are what makes <video> playback work: the browser aborts the progressive
+   stream and re-requests from an offset whenever it seeks or refills its buffer,
+   and answering that with a 200 from byte zero leaves the player stuck on a
+   spinner. Returns 1 for a satisfiable range, 0 for "send the whole file"
+   (absent, malformed, or multi-range), -1 for unsatisfiable. */
+static int parse_byte_range(const char* header, long long file_size, long long* out_start, long long* out_end) {
+    if (!header || strncmp(header, "bytes=", 6) != 0 || file_size <= 0) {
+        return 0;
+    }
+
+    const char* spec = header + 6;
+    while (*spec == ' ') spec++;
+    if (strchr(spec, ',')) {
+        return 0;  // Multi-range: rare from media players, not worth a multipart body.
+    }
+
+    const char* dash = strchr(spec, '-');
+    if (!dash) {
+        return 0;
+    }
+
+    long long start = 0;
+    long long end = file_size - 1;
+
+    if (dash == spec) {
+        // "bytes=-N": the last N bytes. Players use this to find the moov atom.
+        long long suffix = atoll(dash + 1);
+        if (suffix <= 0) {
+            return -1;
+        }
+        start = (suffix >= file_size) ? 0 : file_size - suffix;
+    } else {
+        start = atoll(spec);
+        if (dash[1] != '\0') {
+            end = atoll(dash + 1);
+        }
+    }
+
+    if (start < 0 || start >= file_size) {
+        return -1;
+    }
+    if (end >= file_size) {
+        end = file_size - 1;
+    }
+    if (end < start) {
+        return -1;
+    }
+
+    *out_start = start;
+    *out_end = end;
+    return 1;
+}
+
+static int stream_file_response(const ACAP_HTTP_Response response, const ACAP_HTTP_Request request, const char* path, const char* content_type, const char* disposition, const char* filename) {
     long long started_ms = monotonic_ms();
     LOG("%s: start path=%s disposition=%s filename=%s\n", __func__, path ? path : "(null)", disposition ? disposition : "(null)", filename ? filename : "(null)");
 
@@ -1039,13 +1036,59 @@ static int stream_file_response(const ACAP_HTTP_Response response, const char* p
     }
 
     fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
+    long long file_size = (long long)ftell(file);
     fseek(file, 0, SEEK_SET);
 
-    ACAP_HTTP_Respond_String(response, "Status: 200 OK\r\n");
+    /* A live recording keeps growing, so the export/preview file behind this path
+       can be rebuilt and renamed while a player is part-way through it. The open
+       handle above keeps this response consistent, but a later ranged request
+       reopens the path and would splice bytes from a different file into the same
+       playback. Tag the response with size+mtime and honour If-Range: when the
+       browser asks for more of a file that no longer exists, it gets the whole
+       current one (200) instead of a corrupt mix. */
+    char etag[96];
+    struct stat file_st;
+    if (fstat(fileno(file), &file_st) == 0) {
+        snprintf(etag, sizeof(etag), "\"%lld-%lld\"",
+                 (long long)file_st.st_size, (long long)file_st.st_mtime);
+    } else {
+        snprintf(etag, sizeof(etag), "\"%lld\"", file_size);
+    }
+
+    const char* if_range = ACAP_HTTP_Request_Header(request, "HTTP_IF_RANGE");
+    const char* range_header = ACAP_HTTP_Request_Header(request, "HTTP_RANGE");
+    if (if_range && strcmp(if_range, etag) != 0) {
+        LOG("%s: file changed since range was issued path=%s if_range=%s etag=%s\n",
+            __func__, path ? path : "(null)", if_range, etag);
+        range_header = NULL;
+    }
+    long long range_start = 0;
+    long long range_end = file_size > 0 ? file_size - 1 : 0;
+    int range = parse_byte_range(range_header, file_size, &range_start, &range_end);
+
+    if (range < 0) {
+        LOG_WARN("%s: unsatisfiable range path=%s range=%s size=%lld\n",
+                 __func__, path ? path : "(null)", range_header, file_size);
+        ACAP_HTTP_Respond_String(response, "Status: 416 Range Not Satisfiable\r\n");
+        ACAP_HTTP_Respond_String(response, "Content-Range: bytes */%lld\r\n", file_size);
+        ACAP_HTTP_Respond_String(response, "Content-Length: 0\r\n");
+        ACAP_HTTP_Respond_String(response, "\r\n");
+        fclose(file);
+        return 0;
+    }
+
+    long long send_bytes = range ? (range_end - range_start + 1) : file_size;
+
+    ACAP_HTTP_Respond_String(response, range ? "Status: 206 Partial Content\r\n" : "Status: 200 OK\r\n");
     ACAP_HTTP_Respond_String(response, "Content-Type: %s\r\n", content_type);
     ACAP_HTTP_Respond_String(response, "Content-Disposition: %s; filename=\"%s\"; filename*=UTF-8''%s\r\n", disposition, filename, filename);
-    ACAP_HTTP_Respond_String(response, "Content-Length: %ld\r\n", file_size);
+    ACAP_HTTP_Respond_String(response, "Accept-Ranges: bytes\r\n");
+    ACAP_HTTP_Respond_String(response, "ETag: %s\r\n", etag);
+    ACAP_HTTP_Respond_String(response, "Cache-Control: no-cache\r\n");
+    if (range) {
+        ACAP_HTTP_Respond_String(response, "Content-Range: bytes %lld-%lld/%lld\r\n", range_start, range_end, file_size);
+    }
+    ACAP_HTTP_Respond_String(response, "Content-Length: %lld\r\n", send_bytes);
     ACAP_HTTP_Respond_String(response, "\r\n");
 
     char* buffer = malloc(65536);
@@ -1055,35 +1098,52 @@ static int stream_file_response(const ACAP_HTTP_Response response, const char* p
         return 0;
     }
 
+    if (range && fseek(file, (long)range_start, SEEK_SET) != 0) {
+        LOG_WARN("%s: seek failed path=%s offset=%lld err=%s\n",
+                 __func__, path ? path : "(null)", range_start, strerror(errno));
+        free(buffer);
+        fclose(file);
+        return 0;
+    }
+
     size_t bytes_read;
     long long bytes_sent = 0;
-    while ((bytes_read = fread(buffer, 1, 65536, file)) > 0) {
+    long long remaining = send_bytes;
+    while (remaining > 0) {
+        size_t want = remaining < 65536 ? (size_t)remaining : 65536;
+        bytes_read = fread(buffer, 1, want, file);
+        if (bytes_read == 0) {
+            break;
+        }
         if (ACAP_HTTP_Respond_Data(response, bytes_read, buffer) != 1) {
-            LOG_WARN("%s: short send path=%s bytes_sent=%lld\n", __func__, path ? path : "(null)", bytes_sent);
+            // Normally just the browser cancelling a download or seeking in a
+            // video, not a server fault - the completion line below has the detail.
+            LOG("%s: client closed early path=%s bytes_sent=%lld\n", __func__, path ? path : "(null)", bytes_sent);
             break;
         }
         bytes_sent += (long long)bytes_read;
+        remaining -= (long long)bytes_read;
     }
 
     free(buffer);
     fclose(file);
-    LOG("%s: done path=%s size=%ld bytes_sent=%lld elapsed_ms=%lld\n",
-        __func__, path ? path : "(null)", file_size, bytes_sent, monotonic_ms() - started_ms);
+    LOG("%s: done path=%s size=%lld range=%lld-%lld sent=%lld elapsed_ms=%lld\n",
+        __func__, path ? path : "(null)", file_size,
+        range ? range_start : 0, range ? range_end : (file_size > 0 ? file_size - 1 : 0),
+        bytes_sent, monotonic_ms() - started_ms);
     return 1;
 }
 
 cJSON* Recordings_Get_List(void) {
-    Recordings_Container = recording_store_list();
-    return Recordings_Container;
+    return recording_store_snapshot();
 }
 
 cJSON* Recordings_Get_Metadata(const char* profileId) {
-    return recording_store_get(profileId);
+    return recording_store_get_copy(profileId);
 }
 
 int Recordings_Capture(cJSON* profile) {
     int result = recording_store_capture_profile(profile);
-    Recordings_Container = recording_store_list();
     return result ? 0 : -1;
 }
 
@@ -1108,19 +1168,18 @@ int Recordings_Archive(const char *profileID) {
         return -1;
     }
 
-    // Get metadata before clearing anything
+    // Runs on a background thread and ffmpeg below can take minutes, so both of
+    // these are private copies - the profile may be edited or deleted meanwhile.
     cJSON *recordingMetadata = Recordings_Get_Metadata(profileID);
     if (!recordingMetadata) {
         LOG_WARN("No metadata found for profile: %s\n", profileID);
-		//pthread_mutex_unlock(&recordings_mutex);
         return -1;
     }
 
-    // Get profile information
-    cJSON *profile = Timelapse_Find_Profile_By_Id(profileID);
+    cJSON *profile = Timelapse_Get_Profile(profileID);
     if (!profile) {
         LOG_WARN("Profile not found for ID: %s\n", profileID);
-		//pthread_mutex_unlock(&recordings_mutex);
+        cJSON_Delete(recordingMetadata);
         return -1;
     }
 
@@ -1128,13 +1187,15 @@ int Recordings_Archive(const char *profileID) {
     cJSON *nameItem = cJSON_GetObjectItem(profile, "name");
     if (!nameItem || !nameItem->valuestring) {
         LOG_WARN("%s: Profile missing 'name' field: %s\n", __func__, profileID);
+        cJSON_Delete(recordingMetadata);
+        cJSON_Delete(profile);
         return -1;
     }
-    const char *profileName = nameItem->valuestring;
     char sanitizedProfileName[PATH_MAX_LEN];
-    strncpy(sanitizedProfileName, profileName, PATH_MAX_LEN - 1);
+    strncpy(sanitizedProfileName, nameItem->valuestring, PATH_MAX_LEN - 1);
     sanitizedProfileName[PATH_MAX_LEN - 1] = '\0';
     replace_spaces_with_underscores(sanitizedProfileName);
+    cJSON_Delete(profile);
 
     time_t now = time(NULL);
     struct tm *timeinfo = localtime(&now);
@@ -1146,6 +1207,7 @@ int Recordings_Archive(const char *profileID) {
 
     if (!storage_join(archiveFullPath, sizeof(archiveFullPath), archivePath, archiveFilename)) {
         LOG_WARN("%s: Archive filename is too long\n", __func__);
+        cJSON_Delete(recordingMetadata);
         return -1;
     }
 
@@ -1156,6 +1218,7 @@ int Recordings_Archive(const char *profileID) {
         LOG_WARN("%s: Failed to create archive MP4 profile=%s fps=%d output=%s err=%s\n",
                  __func__, profileID, fps, archiveFullPath, media_last_error());
         unlink(archiveFullPath);
+        cJSON_Delete(recordingMetadata);
         return -1;
     }
 
@@ -1163,6 +1226,7 @@ int Recordings_Archive(const char *profileID) {
     if (stat(archiveFullPath, &archiveStat) == -1) {
         LOG_WARN("%s: Failed to stat archive MP4 %s\n", __func__, archiveFullPath);
         unlink(archiveFullPath);
+        cJSON_Delete(recordingMetadata);
         return -1;
     }
 
@@ -1174,6 +1238,7 @@ int Recordings_Archive(const char *profileID) {
     if (!sizeItem || !imagesItem || !fpsItem || !firstItem || !lastItem) {
         LOG_WARN("%s: Incomplete metadata for profile %s, removing archive\n", __func__, profileID);
         unlink(archiveFullPath);
+        cJSON_Delete(recordingMetadata);
         return -1;
     }
 
@@ -1199,14 +1264,11 @@ int Recordings_Archive(const char *profileID) {
     save_archive_list();
     g_rec_mutex_unlock(&archive_list_mutex);
 
-    // Update profile archived timestamp
-    if (!cJSON_GetObjectItem(profile, "archived")) {
-        cJSON_AddNumberToObject(profile, "archived", ACAP_DEVICE_Timestamp());
-    } else {
-        cJSON_SetNumberValue(cJSON_GetObjectItem(profile, "archived"),
-                            ACAP_DEVICE_Timestamp());
-    }
-    Timelapse_Save_Profiles();
+    cJSON_Delete(recordingMetadata);
+
+    // Update profile archived timestamp. Goes through the store so the profile
+    // tree is only ever touched under its lock - see the note in timelapse.c.
+    Timelapse_Set_Profile_Number(profileID, "archived", ACAP_DEVICE_Timestamp());
 
     // Clear original recording
     Recordings_Clear(profileID);
@@ -1398,9 +1460,10 @@ static void HTTP_Endpoint_Export(const ACAP_HTTP_Response response,
         return;
     }
 
-    cJSON* profile = Timelapse_Find_Profile_By_Id(profileId);
+    cJSON* profile = Timelapse_Get_Profile(profileId);
     int fps = 10;
-    const char* profile_name = profileId;
+    char profile_name[PATH_MAX_LEN];
+    g_strlcpy(profile_name, profileId, sizeof(profile_name));
     if (profile) {
         cJSON* fps_item = cJSON_GetObjectItem(profile, "fps");
         cJSON* name_item = cJSON_GetObjectItem(profile, "name");
@@ -1408,8 +1471,9 @@ static void HTTP_Endpoint_Export(const ACAP_HTTP_Response response,
             fps = fps_item->valueint;
         }
         if (name_item && name_item->valuestring && name_item->valuestring[0]) {
-            profile_name = name_item->valuestring;
+            g_strlcpy(profile_name, name_item->valuestring, sizeof(profile_name));
         }
+        cJSON_Delete(profile);
     }
 
 	if( fps < 1 ) fps = 1;
@@ -1442,7 +1506,7 @@ static void HTTP_Endpoint_Export(const ACAP_HTTP_Response response,
 
     char download_name[PATH_MAX_LEN];
     build_timestamped_export_filename(download_name, sizeof(download_name), profile_name);
-    stream_file_response(response, output_path, "video/mp4", "attachment", download_name);
+    stream_file_response(response, request, output_path, "video/mp4", "attachment", download_name);
 }
 
 static void HTTP_Endpoint_Video(const ACAP_HTTP_Response response, const ACAP_HTTP_Request request) {
@@ -1496,12 +1560,12 @@ static void HTTP_Endpoint_Video(const ACAP_HTTP_Response response, const ACAP_HT
 
     LOG("%s: generated profile=%s fps=%d path=%s elapsed_ms=%lld\n", __func__, profileId, fps, output_path, monotonic_ms() - started_ms);
 
-    stream_file_response(response, output_path, "video/mp4", "inline", "preview.mp4");
+    stream_file_response(response, request, output_path, "video/mp4", "inline", "preview.mp4");
 }
 
-// Adds an "estimatedSize" field (projected final export MP4 size) to a *duplicated*
-// recording object for API responses. Never mutates the shared Recordings_Container,
-// since that object gets persisted verbatim by recording_store.c on the next capture.
+// Adds an "estimatedSize" field (projected final export MP4 size) to a recording
+// object for API responses. Only ever called on a snapshot from recording_store,
+// never on the live tree - that one gets persisted verbatim on the next capture.
 static void Attach_Estimated_Video_Size(cJSON* recording, const char* profileId) {
     if (!recording || !profileId) {
         return;
@@ -1531,31 +1595,18 @@ HTTP_Endpoint_Recordings(const ACAP_HTTP_Response response,
 	LOG_TRACE("%s: %s\n",__func__,method);
 
     if (strcmp(method, "GET") == 0) {
-        if (!Recordings_Container) {
-            load_recordings();
-        }
-
         const char* profileId = ACAP_HTTP_Request_Param(request, "id");
         if (profileId) {
-            cJSON* recording = cJSON_GetObjectItem(Recordings_Container, profileId);
-            if (!recording) {
-                ACAP_HTTP_Respond_Error(response, 404, "Recording not found");
-                return;
-            }
-            cJSON* out = cJSON_Duplicate(recording, 1);
+            cJSON* out = Recordings_Get_Metadata(profileId);
             if (!out) {
-                ACAP_HTTP_Respond_JSON(response, recording);
+                ACAP_HTTP_Respond_Error(response, 404, "Recording not found");
                 return;
             }
             Attach_Estimated_Video_Size(out, profileId);
             ACAP_HTTP_Respond_JSON(response, out);
             cJSON_Delete(out);
         } else {
-            cJSON* out = cJSON_Duplicate(Recordings_Container, 1);
-            if (!out) {
-                ACAP_HTTP_Respond_JSON(response, Recordings_Container);
-                return;
-            }
+            cJSON* out = Recordings_Get_List();
             for (cJSON* item = out->child; item; item = item->next) {
                 Attach_Estimated_Video_Size(item, item->string);
             }
@@ -1587,13 +1638,14 @@ HTTP_Endpoint_Recordings(const ACAP_HTTP_Response response,
             return;
         }
 
-        cJSON* profile = Timelapse_Find_Profile_By_Id(profileId);
+        cJSON* profile = Timelapse_Get_Profile(profileId);
         if (!profile) {
             ACAP_HTTP_Respond_Error(response, 404, "Profile not found");
             return;
         }
         cJSON* fpsItem = cJSON_GetObjectItem(profile, "fps");
         int fps = fpsItem ? fpsItem->valueint : 10;
+        cJSON_Delete(profile);
 
         LOG("%s: queueing force-process of pending chunks profile=%s fps=%d\n", __func__, profileId, fps);
         // Runs on a background thread - see the Queue_Refresh_Media comment above for why this
@@ -1696,7 +1748,7 @@ static void HTTP_Endpoint_Download(const ACAP_HTTP_Response response, const ACAP
         return;
     }
 
-    stream_file_response(response, filepath, "video/mp4", inline_param && strcmp(inline_param, "1") == 0 ? "inline" : "attachment", filename);
+    stream_file_response(response, request, filepath, "video/mp4", inline_param && strcmp(inline_param, "1") == 0 ? "inline" : "attachment", filename);
 }
 
 
@@ -1713,7 +1765,6 @@ static void HTTP_Endpoint_Test(const ACAP_HTTP_Response response, const ACAP_HTT
 void
 Recordings_Reset() {
     recording_store_reset();
-    Recordings_Container = recording_store_list();
     g_rec_mutex_lock(&archive_list_mutex);
 	if( ArchiveList )
 		cJSON_Delete( ArchiveList );
@@ -1748,13 +1799,13 @@ LOG_TRACE("Midnight check: %d:%d", hour, minute);
 
     LOG_TRACE("Archive duration check");
     GPtrArray* due_profile_ids = g_ptr_array_new_with_free_func(g_free);
-    cJSON *recording = Recordings_Container ? Recordings_Container->child : NULL;
-    while(recording) {
+    cJSON *recordings = Recordings_Get_List();
+    for (cJSON *recording = recordings->child; recording; recording = recording->next) {
         if (recording_due_for_archive(recording->string, recording, now)) {
             g_ptr_array_add(due_profile_ids, g_strdup(recording->string));
         }
-        recording = recording->next;
     }
+    cJSON_Delete(recordings);
     if (due_profile_ids->len > 0) {
         // Archiving runs ffmpeg and can take minutes for a busy profile; doing this inline
         // here would stall every timer/event capture trigger on this thread (the GLib main
@@ -1787,28 +1838,22 @@ static gint chunk_sweep_running = 0;
 
 static gpointer process_chunks_thread(gpointer user_data) {
     (void)user_data;
-    cJSON *recording = Recordings_Container ? Recordings_Container->child : NULL;
+    // A snapshot, not the live tree: capture on the main thread mutates the real
+    // one while this sweep walks it, and encoding a batch below takes real time.
+    cJSON *recordings = Recordings_Get_List();
     int processed = 0;
     int skipped = 0;
 
-    while (recording) {
+    for (cJSON *recording = recordings->child; recording; recording = recording->next) {
         const char* profile_id = recording->string;
         cJSON* images = cJSON_GetObjectItem(recording, "images");
         int image_count = images ? images->valueint : 0;
         if (!profile_id || image_count < 1) {
             skipped++;
-            recording = recording->next;
             continue;
         }
 
-        cJSON* profile = Timelapse_Find_Profile_By_Id(profile_id);
-        int fps = 10;
-        if (profile) {
-            cJSON* fps_item = cJSON_GetObjectItem(profile, "fps");
-            if (fps_item && fps_item->type == cJSON_Number) {
-                fps = fps_item->valueint;
-            }
-        }
+        int fps = Timelapse_Get_Profile_Int(profile_id, "fps", 10);
 
         if (!media_process_pending(profile_id, fps)) {
             LOG_WARN("%s: skip profile=%s fps=%d err=%s\n", __func__, profile_id, fps, media_last_error());
@@ -1816,9 +1861,8 @@ static gpointer process_chunks_thread(gpointer user_data) {
         } else {
             processed++;
         }
-
-        recording = recording->next;
     }
+    cJSON_Delete(recordings);
 
     LOG("%s: done processed=%d skipped=%d\n", __func__, processed, skipped);
     g_atomic_int_set(&chunk_sweep_running, 0);
@@ -1853,7 +1897,6 @@ int
 Recordings_Init(void) {
     LOG_TRACE("%s:\n", __func__);
 	recording_store_init();
-    Recordings_Container = recording_store_list();
 	load_archive_list();
 
     // Schedule retention check at midnight

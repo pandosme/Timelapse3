@@ -281,21 +281,26 @@ function showModal(id) {
     bootstrap.Modal.getOrCreateInstance(document.getElementById(id)).show();
 }
 
+// Bootstrap's Modal.hide() is a no-op while the show animation is still running - it bails on
+// its internal _isTransitioning guard. Any job that finishes inside the ~300ms fade-in therefore
+// strands the busy modal on screen forever, which is exactly what a cache-hit Export or Play
+// does: PUT + one status poll can complete in well under 300ms. A refused hide() leaves the
+// 'show' class in place (a successful one removes it synchronously), so use that to detect the
+// refusal and replay the hide as soon as the show transition reports done.
 function hideModal(id) {
-    bootstrap.Modal.getOrCreateInstance(document.getElementById(id)).hide();
+    const element = document.getElementById(id);
+    const instance = bootstrap.Modal.getOrCreateInstance(element);
+    instance.hide();
+    if (element.classList.contains('show')) {
+        element.addEventListener('shown.bs.modal', function() {
+            bootstrap.Modal.getOrCreateInstance(element).hide();
+        }, { once: true });
+    }
 }
 
-// indeterminate: true for waits with no real percentage to report (e.g. the browser buffering
-// an already-finalized archive file - there's no background job to poll here, so a 0%-wide bar
-// left untouched just looks dead; a full-width bar shows the existing striped/animated CSS
-// instead of claiming a specific progress number we don't actually have).
-function showBusy(message, indeterminate) {
+function showBusy(message) {
     $('#busyModalText').text(message || 'Please wait...');
-    if (indeterminate) {
-        $('#busyModalProgressBar').css('width', '100%').text('');
-    } else {
-        $('#busyModalProgressBar').css('width', '0%').text('0%');
-    }
+    $('#busyModalProgressBar').css('width', '0%').text('0%');
     showModal('busyModal');
 }
 
@@ -825,6 +830,11 @@ $(document).ready(function() {
     $('#playModal').on('hidden.bs.modal', function() {
         const video = document.getElementById('playVideo');
         video.pause();
+        // Detach first: clearing the source and re-loading can itself raise an error event,
+        // which would otherwise fire playArchive's handler and toast a bogus failure.
+        video.onloadeddata = null;
+        video.oncanplay = null;
+        video.onerror = null;
         video.removeAttribute('src');
         video.load();
     });
@@ -1056,71 +1066,40 @@ function playRecording(id) {
     });
 }
 
+// An archive is an already-finalized MP4 - nothing to prepare, no background job to poll. So
+// there is deliberately no busy modal/progress bar here: open the player straight away and let
+// the browser's own buffering indicator cover the fetch. (There used to be an indeterminate
+// busy bar waiting on loadeddata/canplay before showing the player - with preload="metadata"
+// those events don't necessarily fire until playback starts, so the static-backdrop busy modal
+// just sat there until its timeout and the archive was unplayable.)
 function playArchive(filename) {
     const video = document.getElementById('playVideo');
     video.pause();
 
-    // Archives are already-finalized files - there's no background job to poll, just the
-    // browser fetching/buffering, so this has no real percentage to report.
-    showBusy('Loading archive', true);
-
-    let settled = false;
-    let timeoutId = null;
-
-    const cleanupHandlers = function() {
-        video.onloadeddata = null;
-        video.oncanplay = null;
+    video.onerror = function() {
         video.onerror = null;
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            timeoutId = null;
-        }
-    };
-
-    const onReady = function() {
-        if (settled) return;
-        settled = true;
-        cleanupHandlers();
-        hideBusy();
-        showModal('playModal');
-    };
-
-    const onError = function() {
-        if (settled) return;
-        settled = true;
-        cleanupHandlers();
-        hideBusy();
+        hideModal('playModal');
         showToast('Failed to load archive.', 'error');
     };
-
-    video.onloadeddata = onReady;
-    video.oncanplay = onReady;
-    video.onerror = onError;
-
-    timeoutId = setTimeout(function() {
-        onError();
-    }, 30000);
 
     video.currentTime = 0;
     video.src = 'download?inline=1&filename=' + encodeURIComponent(filename) + '&_=' + Date.now();
     video.load();
+    showModal('playModal');
 }
 
 function exportRecording(id) {
     showBusy('Preparing export...');
     mediaJobStage = 'Preparing export...';
     runBackgroundJobThen('recordings?id=' + encodeURIComponent(id), function() {
-        setBusyProgress('Starting download...', 99);
+        // The PUT above already did the catch-up encode, so the GET below is just a file fetch
+        // the browser turns into a download - there is nothing left to report progress on. Close
+        // the busy modal first, then start the download from a hidden iframe (same pattern as
+        // downloadArchive). A top-level form.submit() used to be the trigger here, and its
+        // pending navigation froze the modal's fade-out mid-transition: the file downloaded fine
+        // but a dead 99% progress bar stayed on screen.
         hideBusy();
-        const form = document.createElement('form');
-        form.method = 'GET';
-        form.action = 'export';
-
-        appendHiddenField(form, 'id', id);
-
-        document.body.appendChild(form);
-        form.submit();
-        document.body.removeChild(form);
+        startFileDownload('export?id=' + encodeURIComponent(id));
     });
 }
 
@@ -1269,12 +1248,19 @@ function editTimelapse(profileId) {
     showModal('timelapseModal');
 }
 
-function appendHiddenField(form, name, value) {
-    const field = document.createElement('input');
-    field.type = 'hidden';
-    field.name = name;
-    field.value = value;
-    form.appendChild(field);
+// Starts a file download without a top-level navigation, so the page (and any modal animation
+// in flight) is left alone. The iframe is kept around long enough for the browser to receive the
+// response headers and take the download over.
+function startFileDownload(url) {
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = url;
+    document.body.appendChild(iframe);
+    setTimeout(function() {
+        if (iframe.parentNode) {
+            document.body.removeChild(iframe);
+        }
+    }, 60000);
 }
 
 function resetLiveMedia(id) {
@@ -1357,13 +1343,7 @@ function archiveRecording(profileId) {
 }
 
 function downloadArchive(filename) {
-    const iframe = document.createElement('iframe');
-    iframe.style.display = 'none';
-    iframe.src = 'download?filename=' + encodeURIComponent(filename);
-    document.body.appendChild(iframe);
-    setTimeout(function() {
-        document.body.removeChild(iframe);
-    }, 2000);
+    startFileDownload('download?filename=' + encodeURIComponent(filename));
 }
 
 function deleteArchive(filename) {

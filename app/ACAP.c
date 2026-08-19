@@ -35,7 +35,15 @@
 static cJSON* app = NULL;
 static cJSON* status_container = NULL;
 
+/* status_container is written from the GLib main thread and from the media
+ * worker threads (job progress), and serialised by the FastCGI thread on every
+ * /status and /app poll. cJSON_ReplaceItemInObject() frees the old value, so an
+ * unsynchronised poll during a job update walks freed nodes and corrupts the
+ * heap. Recursive because the Set* helpers call ACAP_STATUS_Group(). */
+static GRecMutex status_lock;
+
 cJSON* 		ACAP_STATUS(void);
+static void	ACAP_HTTP_Cache_Declared_Nodes(cJSON* manifest);
 int			ACAP_HTTP(void);
 void		ACAP_HTTP_Process(void);
 void		ACAP_HTTP_Cleanup(void);
@@ -89,6 +97,8 @@ cJSON* ACAP(const char* package, ACAP_Config_Update callback) {
     cJSON* manifest = ACAP_FILE_Read("manifest.json");
     if (manifest) {
         cJSON_AddItemToObject(app, "manifest", manifest);
+        // Must happen before ACAP_HTTP() starts the FastCGI thread.
+        ACAP_HTTP_Cache_Declared_Nodes(manifest);
     }
 
     // Load and merge settings
@@ -145,7 +155,10 @@ ACAP_ENDPOINT_app(const ACAP_HTTP_Response response, const ACAP_HTTP_Request req
         ACAP_HTTP_Respond_Error(response, 405, "Method Not Allowed - Use GET");
         return;
     }
+    /* app carries status_container as a child, so serialise under its lock. */
+    g_rec_mutex_lock(&status_lock);
     ACAP_HTTP_Respond_JSON(response, app);
+    g_rec_mutex_unlock(&status_lock);
 }
 
 static void
@@ -269,6 +282,43 @@ static HTTPNode http_nodes[ACAP_MAX_HTTP_NODES];
 static int http_node_count = 0;
 
 
+/* Endpoint names declared in manifest.json. Handlers register over several
+ * seconds (storage probe, migration check), so a request that arrives in that
+ * window finds no callback. Answering 404 there says "no such endpoint", which
+ * is wrong and sent the GUI down a dead end; these are answered 503 instead. */
+static char declared_nodes[ACAP_MAX_HTTP_NODES][ACAP_MAX_PATH_LENGTH];
+static int declared_node_count = 0;
+
+/* Main thread, before the FastCGI thread starts. */
+static void ACAP_HTTP_Cache_Declared_Nodes(cJSON* manifest) {
+    cJSON* conf = cJSON_GetObjectItem(manifest, "acapPackageConf");
+    cJSON* configuration = conf ? cJSON_GetObjectItem(conf, "configuration") : NULL;
+    cJSON* httpConfig = configuration ? cJSON_GetObjectItem(configuration, "httpConfig") : NULL;
+    if (!httpConfig) {
+        return;
+    }
+
+    cJSON* entry = httpConfig->child;
+    while (entry && declared_node_count < ACAP_MAX_HTTP_NODES) {
+        const char* name = cJSON_GetStringValue(cJSON_GetObjectItem(entry, "name"));
+        if (name && name[0]) {
+            snprintf(declared_nodes[declared_node_count], ACAP_MAX_PATH_LENGTH,
+                     "/local/%s/%s", ACAP_Name(), name);
+            declared_node_count++;
+        }
+        entry = entry->next;
+    }
+}
+
+static int ACAP_HTTP_Is_Declared_Node(const char* path) {
+    for (int i = 0; i < declared_node_count; i++) {
+        if (strcmp(declared_nodes[i], path) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static const char* get_path_without_query(const char* uri) {
     static char path[ACAP_MAX_PATH_LENGTH];
     const char* query = strchr(uri, '?');
@@ -331,6 +381,14 @@ const char* ACAP_HTTP_Get_Method(const ACAP_HTTP_Request request) {
         return NULL;
     }
     return FCGX_GetParam("REQUEST_METHOD", request->request->envp);
+}
+
+/* CGI-style name, e.g. "HTTP_RANGE" for the Range request header. */
+const char* ACAP_HTTP_Request_Header(const ACAP_HTTP_Request request, const char* name) {
+    if (!request || !request->request || !name) {
+        return NULL;
+    }
+    return FCGX_GetParam(name, request->request->envp);
 }
 
 const char* ACAP_HTTP_Get_Content_Type(const ACAP_HTTP_Request request) {
@@ -457,15 +515,20 @@ void ACAP_HTTP_Process() {
     const char* pathOnly = get_path_without_query(uriString);
     ACAP_HTTP_Callback matching_callback = NULL;
 
+    // Handlers keep registering while this thread is already serving requests.
+    pthread_mutex_lock(&http_nodes_mutex);
     for (int i = 0; i < http_node_count; i++) {
         if (strcmp(http_nodes[i].path, pathOnly) == 0) {
             matching_callback = http_nodes[i].callback;
             break;
         }
     }
+    pthread_mutex_unlock(&http_nodes_mutex);
 
     if (matching_callback) {
         matching_callback(&request, &requestData);
+    } else if (ACAP_HTTP_Is_Declared_Node(pathOnly)) {
+        ACAP_HTTP_Respond_Error(&request, 503, "Service is still starting");
     } else {
         ACAP_HTTP_Respond_Error(&request, 404, "Not Found");
     }
@@ -674,10 +737,18 @@ ACAP_ENDPOINT_status(const ACAP_HTTP_Response response, const ACAP_HTTP_Request 
         return;
     }
 
+	g_rec_mutex_lock(&status_lock);
 	if(!status_container)
 		status_container = cJSON_CreateObject();
-    
-    ACAP_HTTP_Respond_JSON(response, status_container);
+	cJSON* snapshot = cJSON_Duplicate(status_container, 1);
+	g_rec_mutex_unlock(&status_lock);
+
+	if (!snapshot) {
+		ACAP_HTTP_Respond_Error(response, 500, "Failed to serialize status");
+		return;
+	}
+	ACAP_HTTP_Respond_JSON(response, snapshot);
+	cJSON_Delete(snapshot);
 }
 
 cJSON* ACAP_STATUS(void) {
@@ -688,6 +759,7 @@ cJSON* ACAP_STATUS(void) {
     return status_container;
 }
 
+/* Caller must hold status_lock. */
 cJSON* ACAP_STATUS_Group(const char* name) {
     if (!name || !status_container) {
         return NULL;
@@ -712,9 +784,11 @@ void ACAP_STATUS_SetBool(const char* group, const char* name, int state) {
         return;
     }
 
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
 		LOG_TRACE("%s: Unknown %s\n",__func__,group);
+        g_rec_mutex_unlock(&status_lock);
         return;
     }
 
@@ -724,6 +798,7 @@ void ACAP_STATUS_SetBool(const char* group, const char* name, int state) {
     } else {
         cJSON_AddItemToObject(groupObj, name, cJSON_CreateBool(state));
     }
+    g_rec_mutex_unlock(&status_lock);
 }
 
 void ACAP_STATUS_SetNumber(const char* group, const char* name, double value) {
@@ -732,8 +807,10 @@ void ACAP_STATUS_SetNumber(const char* group, const char* name, double value) {
         return;
     }
 
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
+        g_rec_mutex_unlock(&status_lock);
         return;
     }
 
@@ -743,6 +820,7 @@ void ACAP_STATUS_SetNumber(const char* group, const char* name, double value) {
     } else {
         cJSON_AddItemToObject(groupObj, name, cJSON_CreateNumber(value));
     }
+    g_rec_mutex_unlock(&status_lock);
 }
 
 void ACAP_STATUS_SetString(const char* group, const char* name, const char* string) {
@@ -751,8 +829,10 @@ void ACAP_STATUS_SetString(const char* group, const char* name, const char* stri
         return;
     }
 
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
+        g_rec_mutex_unlock(&status_lock);
         return;
     }
 
@@ -762,6 +842,7 @@ void ACAP_STATUS_SetString(const char* group, const char* name, const char* stri
     } else {
         cJSON_AddItemToObject(groupObj, name, cJSON_CreateString(string));
     }
+    g_rec_mutex_unlock(&status_lock);
 }
 
 void ACAP_STATUS_SetObject(const char* group, const char* name, cJSON* data) {
@@ -770,8 +851,10 @@ void ACAP_STATUS_SetObject(const char* group, const char* name, cJSON* data) {
         return;
     }
 
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
+        g_rec_mutex_unlock(&status_lock);
         return;
     }
 
@@ -781,6 +864,7 @@ void ACAP_STATUS_SetObject(const char* group, const char* name, cJSON* data) {
     } else {
         cJSON_AddItemToObject(groupObj, name, cJSON_Duplicate(data, 1));
     }
+    g_rec_mutex_unlock(&status_lock);
 }
 
 void ACAP_STATUS_SetNull(const char* group, const char* name) {
@@ -789,8 +873,10 @@ void ACAP_STATUS_SetNull(const char* group, const char* name) {
         return;
     }
 
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
+        g_rec_mutex_unlock(&status_lock);
         return;
     }
 
@@ -800,6 +886,7 @@ void ACAP_STATUS_SetNull(const char* group, const char* name) {
     } else {
         cJSON_AddItemToObject(groupObj, name, cJSON_CreateNull());
     }
+    g_rec_mutex_unlock(&status_lock);
 }
 
 /*------------------------------------------------------------------
@@ -1436,7 +1523,7 @@ FILE* ACAP_FILE_Open(const char* filepath, const char* mode) {
     }
     
     FILE* file = fopen(fullpath, mode);
-    if (!file) {
+    if (!file && errno != ENOENT) {
         LOG_WARN("%s: Opening file %s failed: %s\n", __func__, fullpath, strerror(errno));
     }
     return file;
@@ -1466,7 +1553,11 @@ cJSON* ACAP_FILE_Read(const char* filepath) {
 
     FILE* file = ACAP_FILE_Open(filepath, "r");
     if (!file) {
-		LOG_WARN("%s: File open error %s\n",__func__,filepath);
+        /* Absent is a normal state for optional files such as
+           localdata/settings.json, which only exists once settings are saved. */
+        if (errno != ENOENT) {
+            LOG_WARN("%s: File open error %s\n", __func__, filepath);
+        }
         return NULL;
     }
 
@@ -2455,10 +2546,16 @@ void ACAP_Cleanup(void) {
     // free, corrupting the heap. Bounded so a stuck job can't hang shutdown forever.
     ACAP_Background_Jobs_Wait(30000);
 
-    if (status_container) {
+    // No status_lock here on purpose: the FastCGI thread is already joined and
+    // the background jobs have drained, so nothing else can touch this, and
+    // taking a lock a cancelled thread might still hold could hang shutdown.
+    //
+    // ACAP_Set_Config("status", ACAP_STATUS()) attached status_container to app,
+    // so app owns it - freeing it here as well is a double free.
+    if (status_container && (!app || cJSON_GetObjectItem(app, "status") != status_container)) {
         cJSON_Delete(status_container);
-        status_container = NULL;
     }
+    status_container = NULL;
 
 	LOG_TRACE("%s:",__func__);
     if (app) {

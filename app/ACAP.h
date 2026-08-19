@@ -82,6 +82,7 @@ const char* ACAP_HTTP_Get_Method(const ACAP_HTTP_Request request);
 const char* ACAP_HTTP_Get_Content_Type(const ACAP_HTTP_Request request);
 size_t 		ACAP_HTTP_Get_Content_Length(const ACAP_HTTP_Request request);
 const char* ACAP_HTTP_Request_Param(const ACAP_HTTP_Request request, const char* param);
+const char* ACAP_HTTP_Request_Header(const ACAP_HTTP_Request request, const char* name);
 cJSON* 		ACAP_HTTP_Request_JSON(const ACAP_HTTP_Request request, const char* param);
 
 // HTTP Response helpers

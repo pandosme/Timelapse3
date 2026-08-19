@@ -264,6 +264,29 @@ The About page shows:
 
 ## History
 
+### 3.1.1
+Playback and user interface:
+- Fixed archived recordings not playing: the progress dialog stayed on screen and blocked the player. Archives are finished MP4 files, so they now open directly in the player with no progress dialog.
+- Fixed the busy dialog staying on screen after a fast Export or Play that completed while the dialog was still fading in.
+- Fixed a dead progress bar left behind after an MP4 download started.
+- Fixed a false error message shown when a video download was cancelled or the player was closed early.
+- Added byte-range support to video responses. Without it the browser's player could stop part way through a recording and wait forever on the buffering spinner as soon as it needed to seek or refill its buffer.
+- Fixed playback stopping at the point where new material was appended to a recording. Preview, export and archive video were encoded with different quality presets and then joined by copy, which produced an MP4 whose header did not match the second half. All parts now use the same encoder settings.
+- Fixed the first playback of a recording having to download the whole video before it could start.
+- A recording rebuilt while it is being played or downloaded no longer feeds the player a mix of the old and new file.
+- The app answers "still starting" instead of "not found" for requests that arrive during the first seconds after start, so the interface no longer dead-ends on a slow SD card check.
+
+Video encoding:
+- Fixed exports, previews and archives failing on cameras with limited memory. The software encoder gave every thread its own copy of the frames in flight, which on high-resolution recordings used enough memory for the camera to kill it mid-encode. Encoding now splits each frame across the cores instead, keeping memory bounded without losing speed.
+- Encoding failures now report the real cause in the log and the interface. A killed encoder previously produced an empty error message.
+- The hardware H.264 encoder is now probed once per app start instead of on every job. On cameras without it, each export, preview and archive previously wasted about a second and filled the system log with the same failure text.
+
+Stability:
+- Fixed a crash on shutdown and restart caused by freeing application state twice.
+- Fixed heap corruption when the interface polled status while a media job was updating it.
+- Recording data used by background encoding is now read as a snapshot under lock, so capture writing new frames during an export or archive can no longer corrupt it.
+- Removed misleading warnings about a missing settings file that is simply not created until settings are saved.
+
 ### 3.1.0 - July 24, 2026
 Main changes from Timelapse Version 2.x:  
 - Changed recording output from AVI to MP4/H.264.

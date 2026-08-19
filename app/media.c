@@ -240,6 +240,62 @@ static int is_v4l2m2m_encoder(const char* encoder_name) {
     return encoder_name && strstr(encoder_name, "_v4l2m2m") != NULL;
 }
 
+static int is_x264_encoder(const char* encoder_name) {
+    return encoder_name && strcmp(encoder_name, "libx264") == 0;
+}
+
+/* libx264 defaults to frame threading, which gives every one of its (CPU count x
+   1.5) threads its own copy of the frames in flight, plus a sync-lookahead queue
+   of one frame per thread. On a high-resolution sequence that reached hundreds of
+   MB and the camera's memory limit SIGKILLed the encoder mid-run (field logs:
+   wait_status=9 with empty stderr). Slice threading instead splits one frame
+   across the cores, so the working set stays at a couple of frames no matter how
+   many threads run - memory bounded without giving up the cores, which matters
+   because a first-time preview encode is what the user waits on. */
+#define X264_LOWMEM_PARAMS "sliced-threads=1:sync-lookahead=0:rc-lookahead=10"
+
+/* Preview, export and archive segments get concatenated into each other with
+   "-c copy" (see the merge steps below), and an MP4 carries ONE parameter set for
+   the whole track. So every segment must be encoded with identical x264 settings:
+   the presets differ in entropy coder and 8x8dct, which changes the H.264 profile
+   (ultrafast -> Constrained Baseline/CAVLC, veryfast -> High/CABAC). Joining those
+   produced a file whose header advertised High while half its samples were
+   Baseline - ffmpeg still decoded it, but a browser stops at the join and waits
+   forever. One setting for all three kinds is what keeps the copy-merge valid. */
+#define H264_PRESET "veryfast"
+#define H264_CRF "24"
+
+/* g_spawn_sync() reports the raw wait status. A child killed by a signal leaves
+   WIFEXITED false and normally writes nothing to stderr, so reporting stderr
+   alone produced an empty "FFmpeg failed:" with no clue why. Name the signal -
+   SIGKILL here is almost always the kernel reclaiming memory. */
+static const char* describe_child_failure(gint wait_status, const char* stderr_text,
+                                          char* buf, size_t buf_len) {
+    if (WIFSIGNALED(wait_status)) {
+        int sig = WTERMSIG(wait_status);
+        snprintf(buf, buf_len, "killed by signal %d%s%s%s", sig,
+                 sig == SIGKILL ? " (out of memory?)" : "",
+                 (stderr_text && stderr_text[0]) ? " " : "",
+                 (stderr_text && stderr_text[0]) ? stderr_text : "");
+        return buf;
+    }
+    if (stderr_text && stderr_text[0]) {
+        return stderr_text;
+    }
+    snprintf(buf, buf_len, "exit status %d",
+             WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : wait_status);
+    return buf;
+}
+
+/* The v4l2 encoder device either exists on this product or it never will, so
+   probe it once per process. Retrying it on every job cost ~1s and pushed the
+   same 20-line failure blob into syslog each time. */
+static gint hw_encoder_unavailable = 0;
+
+static int hw_encoder_missing_device(const char* stderr_text) {
+    return stderr_text && strstr(stderr_text, "Could not find a valid device") != NULL;
+}
+
 static cJSON* read_json_file(const char* path);
 
 static int load_incremental_state(const char* path, int* finalized_frames, int* fps) {
@@ -352,10 +408,13 @@ static cJSON* read_json_file(const char* path) {
 }
 
 static int get_recording_snapshot(const char* profile_id, int fps, RecordingSnapshot* snapshot) {
-    cJSON* recording = recording_store_get(profile_id);
+    /* A copy: this runs on the media worker threads while capture keeps mutating
+       the live recording tree on the GLib main thread. */
+    cJSON* recording = recording_store_get_copy(profile_id);
     cJSON* frames = recording ? cJSON_GetObjectItem(recording, "frames") : NULL;
     if (!frames || frames->valueint < 1) {
         set_last_error("Recording has no frames for %s", profile_id);
+        cJSON_Delete(recording);
         return 0;
     }
 
@@ -371,6 +430,7 @@ static int get_recording_snapshot(const char* profile_id, int fps, RecordingSnap
     snapshot->height = height ? height->valueint : 0;
     snapshot->last = last ? (long long)last->valuedouble : 0;
     snapshot->size_bytes = size ? (long long)size->valuedouble : 0;
+    cJSON_Delete(recording);
     return 1;
 }
 
@@ -790,8 +850,8 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
     char start_number_arg[16];
     snprintf(start_number_arg, sizeof(start_number_arg), "%d", start_number);
 
-    const char* preset = kind == MEDIA_PREVIEW ? "ultrafast" : (kind == MEDIA_ARCHIVE ? "superfast" : "veryfast");
-    const char* crf = kind == MEDIA_PREVIEW ? "30" : (kind == MEDIA_ARCHIVE ? "23" : "24");
+    const char* preset = H264_PRESET;
+    const char* crf = H264_CRF;
 
     /* Fixed frame-count GOP (not fps-scaled); sc_threshold=0 stops libx264 inserting extra
        keyframes on scene cuts. Together these keep the keyframe cadence stable regardless of
@@ -818,142 +878,70 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
     char final_error[512];
     final_error[0] = '\0';
 
+    /* Only the last candidate failing is a real failure. Everything before it is
+       the fallback chain doing its job - h264_v4l2m2m is simply absent on some
+       devices, and warning about it on every export buried the actual errors. */
+
     for (int i = 0; i < candidate_count; i++) {
         const char* encoder = encoder_candidates[i];
         int use_hw = is_v4l2m2m_encoder(encoder);
         int use_faststart = kind != MEDIA_ARCHIVE;
 
-        char* argv_sw_faststart[] = {
-            (char*)ffmpeg_exec,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-framerate",
-            fps_arg,
-            "-start_number",
-            start_number_arg,
-            "-i",
-            input_pattern,
-            "-frames:v",
-            frame_count_arg,
-            "-c:v",
-            (char*)encoder,
-            "-preset",
-            (char*)preset,
-            "-crf",
-            (char*)crf,
-            "-g",
-            gop_arg,
-            "-keyint_min",
-            gop_arg,
-            "-sc_threshold",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-            temp_path,
-            NULL
-        };
+        // Known to have no device on this product, and a fallback is queued behind it.
+        if (use_hw && i + 1 < candidate_count && g_atomic_int_get(&hw_encoder_unavailable)) {
+            continue;
+        }
 
-        char* argv_sw_no_faststart[] = {
-            (char*)ffmpeg_exec,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-framerate",
-            fps_arg,
-            "-start_number",
-            start_number_arg,
-            "-i",
-            input_pattern,
-            "-frames:v",
-            frame_count_arg,
-            "-c:v",
-            (char*)encoder,
-            "-preset",
-            (char*)preset,
-            "-crf",
-            (char*)crf,
-            "-g",
-            gop_arg,
-            "-keyint_min",
-            gop_arg,
-            "-sc_threshold",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "mp4",
-            temp_path,
-            NULL
-        };
-
-        char* argv_hw_faststart[] = {
-            (char*)ffmpeg_exec,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-framerate",
-            fps_arg,
-            "-start_number",
-            start_number_arg,
-            "-i",
-            input_pattern,
-            "-frames:v",
-            frame_count_arg,
-            "-c:v",
-            (char*)encoder,
-            "-pix_fmt",
-            "nv12",
-            "-b:v",
-            "4M",
-            "-g",
-            gop_arg,
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-            temp_path,
-            NULL
-        };
-
-        char* argv_hw_no_faststart[] = {
-            (char*)ffmpeg_exec,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-framerate",
-            fps_arg,
-            "-start_number",
-            start_number_arg,
-            "-i",
-            input_pattern,
-            "-frames:v",
-            frame_count_arg,
-            "-c:v",
-            (char*)encoder,
-            "-pix_fmt",
-            "nv12",
-            "-b:v",
-            "4M",
-            "-g",
-            gop_arg,
-            "-f",
-            "mp4",
-            temp_path,
-            NULL
-        };
-
-        char** argv = use_hw
-            ? (use_faststart ? argv_hw_faststart : argv_hw_no_faststart)
-            : (use_faststart ? argv_sw_faststart : argv_sw_no_faststart);
+        char* argv[48];
+        int argc = 0;
+        argv[argc++] = (char*)ffmpeg_exec;
+        argv[argc++] = "-y";
+        argv[argc++] = "-hide_banner";
+        argv[argc++] = "-loglevel";
+        argv[argc++] = "error";
+        argv[argc++] = "-framerate";
+        argv[argc++] = fps_arg;
+        argv[argc++] = "-start_number";
+        argv[argc++] = start_number_arg;
+        argv[argc++] = "-i";
+        argv[argc++] = input_pattern;
+        argv[argc++] = "-frames:v";
+        argv[argc++] = frame_count_arg;
+        argv[argc++] = "-c:v";
+        argv[argc++] = (char*)encoder;
+        if (use_hw) {
+            argv[argc++] = "-pix_fmt";
+            argv[argc++] = "nv12";
+            argv[argc++] = "-b:v";
+            argv[argc++] = "4M";
+            argv[argc++] = "-g";
+            argv[argc++] = gop_arg;
+        } else {
+            argv[argc++] = "-preset";
+            argv[argc++] = (char*)preset;
+            argv[argc++] = "-crf";
+            argv[argc++] = (char*)crf;
+            argv[argc++] = "-g";
+            argv[argc++] = gop_arg;
+            argv[argc++] = "-keyint_min";
+            argv[argc++] = gop_arg;
+            argv[argc++] = "-sc_threshold";
+            argv[argc++] = "0";
+            argv[argc++] = "-pix_fmt";
+            argv[argc++] = "yuv420p";
+            if (is_x264_encoder(encoder)) {
+                argv[argc++] = "-x264-params";
+                argv[argc++] = X264_LOWMEM_PARAMS;
+            }
+        }
+        if (use_faststart) {
+            argv[argc++] = "-movflags";
+            argv[argc++] = "+faststart";
+        }
+        argv[argc++] = "-f";
+        argv[argc++] = "mp4";
+        argv[argc++] = temp_path;
+        argv[argc] = NULL;
 
         unlink(temp_path);
 
@@ -967,11 +955,17 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
 
         gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
                                    NULL, &stderr_text, &wait_status, &error);
+        int last_candidate = (i + 1 == candidate_count);
         if (!ok) {
             snprintf(final_error, sizeof(final_error), "spawn failed: %s", error ? error->message : "unknown error");
-            LOG_WARN("%s: ffmpeg spawn failed kind=%s profile=%s encoder=%s elapsed_ms=%lld err=%s\n",
-                     __func__, media_kind_name(kind), profile_id, encoder,
-                     monotonic_ms() - ffmpeg_started_ms, error ? error->message : "unknown error");
+            if (last_candidate) {
+                LOG_WARN("%s: ffmpeg spawn failed kind=%s profile=%s encoder=%s elapsed_ms=%lld err=%s\n",
+                         __func__, media_kind_name(kind), profile_id, encoder,
+                         monotonic_ms() - ffmpeg_started_ms, error ? error->message : "unknown error");
+            } else {
+                LOG("%s: encoder %s unavailable, falling back: %s\n",
+                    __func__, encoder, error ? error->message : "unknown error");
+            }
             if (error) {
                 g_error_free(error);
             }
@@ -980,10 +974,22 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
         }
 
         if (!WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
-            snprintf(final_error, sizeof(final_error), "%s", stderr_text ? stderr_text : "unknown error");
-            LOG_WARN("%s: ffmpeg failed kind=%s profile=%s encoder=%s wait_status=%d elapsed_ms=%lld err=%s\n",
-                     __func__, media_kind_name(kind), profile_id, encoder, wait_status,
-                     monotonic_ms() - ffmpeg_started_ms, stderr_text ? stderr_text : "unknown error");
+            char failure_buf[512];
+            const char* failure = describe_child_failure(wait_status, stderr_text,
+                                                         failure_buf, sizeof(failure_buf));
+            snprintf(final_error, sizeof(final_error), "%s", failure);
+            if (use_hw && hw_encoder_missing_device(stderr_text)) {
+                g_atomic_int_set(&hw_encoder_unavailable, 1);
+                LOG("%s: encoder %s has no device on this product; skipping it from now on\n",
+                    __func__, encoder);
+            }
+            if (last_candidate) {
+                LOG_WARN("%s: ffmpeg failed kind=%s profile=%s encoder=%s wait_status=%d elapsed_ms=%lld err=%s\n",
+                         __func__, media_kind_name(kind), profile_id, encoder, wait_status,
+                         monotonic_ms() - ffmpeg_started_ms, failure);
+            } else {
+                LOG("%s: encoder %s failed, falling back to next candidate\n", __func__, encoder);
+            }
             g_free(stderr_text);
             continue;
         }
@@ -1078,10 +1084,15 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
         unlink(temp_path);
 
         if (!concat_ok || !WIFEXITED(concat_wait_status) || WEXITSTATUS(concat_wait_status) != 0) {
+            char concat_failure_buf[512];
+            const char* concat_failure = !concat_ok
+                ? (concat_error ? concat_error->message : "spawn failed")
+                : describe_child_failure(concat_wait_status, concat_stderr,
+                                         concat_failure_buf, sizeof(concat_failure_buf));
             if (media_job) {
                 set_media_encode_status_done(0, "Video merge failed");
             }
-            set_last_error("FFmpeg concat failed: %s", concat_stderr ? concat_stderr : (concat_error ? concat_error->message : "unknown error"));
+            set_last_error("FFmpeg concat failed: %s", concat_failure);
             if (concat_error) {
                 g_error_free(concat_error);
             }
@@ -1327,6 +1338,9 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
     }
     unlink(tail_path);
 
+    char gop_arg[16];
+    snprintf(gop_arg, sizeof(gop_arg), "%d", EXPORT_GOP_FRAMES);
+
     const char* ffmpeg_exec = resolve_ffmpeg_path();
     char* tail_argv[] = {
         (char*)ffmpeg_exec,
@@ -1345,11 +1359,25 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
         "-c:v",
         "libx264",
         "-preset",
-        "ultrafast",
+        H264_PRESET,
         "-crf",
-        "30",
+        H264_CRF,
+        "-g",
+        gop_arg,
+        "-keyint_min",
+        gop_arg,
+        "-sc_threshold",
+        "0",
         "-pix_fmt",
         "yuv420p",
+        "-x264-params",
+        X264_LOWMEM_PARAMS,
+        /* The tail becomes preview.mp4 verbatim when there is no base to merge
+           with (first play of a profile). Without faststart that file carries its
+           moov atom at the end, so the browser cannot start playing until it has
+           pulled the whole thing. The merge path re-applies faststart anyway. */
+        "-movflags",
+        "+faststart",
         "-f",
         "mp4",
         tail_path,
@@ -1364,7 +1392,11 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
     gboolean ok = g_spawn_sync(NULL, tail_argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
                                NULL, &stderr_text, &wait_status, &error);
     if (!ok || !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
-        set_last_error("Preview encode failed: %s", stderr_text ? stderr_text : (error ? error->message : "unknown error"));
+        char failure_buf[512];
+        set_last_error("Preview encode failed: %s",
+                       !ok ? (error ? error->message : "spawn failed")
+                           : describe_child_failure(wait_status, stderr_text,
+                                                    failure_buf, sizeof(failure_buf)));
         LOG_WARN("%s: tail encode failed profile=%s err=%s\n", __func__, profile_id, last_error);
         if (error) {
             g_error_free(error);
@@ -1456,7 +1488,11 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
         unlink(tail_path);
 
         if (!concat_ok || !WIFEXITED(concat_wait_status) || WEXITSTATUS(concat_wait_status) != 0) {
-            set_last_error("Preview merge failed: %s", concat_stderr ? concat_stderr : (concat_error ? concat_error->message : "unknown error"));
+            char concat_failure_buf[512];
+            set_last_error("Preview merge failed: %s",
+                           !concat_ok ? (concat_error ? concat_error->message : "spawn failed")
+                                      : describe_child_failure(concat_wait_status, concat_stderr,
+                                                               concat_failure_buf, sizeof(concat_failure_buf)));
             if (concat_error) {
                 g_error_free(concat_error);
             }
@@ -1653,11 +1689,13 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        H264_PRESET,
         "-crf",
-        "23",
+        H264_CRF,
         "-pix_fmt",
         "yuv420p",
+        "-x264-params",
+        X264_LOWMEM_PARAMS,
         "-movflags",
         "+faststart",
         "-f",
@@ -1749,7 +1787,11 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
     }
 
     if (!ok || !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
-        set_last_error("FFmpeg AVI migration failed: %s", stderr_text ? stderr_text : (spawn_error ? spawn_error->message : "unknown error"));
+        char failure_buf[512];
+        set_last_error("FFmpeg AVI migration failed: %s",
+                       !ok ? (spawn_error ? spawn_error->message : "spawn failed")
+                           : describe_child_failure(wait_status, stderr_text,
+                                                    failure_buf, sizeof(failure_buf)));
         if (spawn_error) {
             g_error_free(spawn_error);
         }
@@ -1892,9 +1934,9 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        H264_PRESET,
         "-crf",
-        "24",
+        H264_CRF,
         "-g",
         gop_arg,
         "-keyint_min",
@@ -1903,6 +1945,8 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
         "0",
         "-pix_fmt",
         "yuv420p",
+        "-x264-params",
+        X264_LOWMEM_PARAMS,
         "-movflags",
         "+faststart",
         "-f",
@@ -1918,9 +1962,12 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
                                NULL, &stderr_text, &wait_status, &error);
 
     if (!ok || !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+        char failure_buf[512];
         set_reencode_status_done(0, "Re-encode failed");
         set_last_error("Failed to re-encode export: %s",
-                       stderr_text ? stderr_text : (error ? error->message : "unknown error"));
+                       !ok ? (error ? error->message : "spawn failed")
+                           : describe_child_failure(wait_status, stderr_text,
+                                                    failure_buf, sizeof(failure_buf)));
         if (error) {
             g_error_free(error);
         }
