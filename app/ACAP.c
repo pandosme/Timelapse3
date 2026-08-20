@@ -2599,15 +2599,20 @@ void ACAP_Cleanup(void) {
     }
     status_container = NULL;
 
+    // ACAP_Set_Config("device", ACAP_DEVICE()) attached this to app the same way, so app owns
+    // it too. This has to be decided here, while app is still alive to be asked - freeing it
+    // after the delete below read a cJSON node app had already freed and walked its freed
+    // children. That is the heap corruption glibc reported much later, as the process aborted
+    // at shutdown with "corrupted size vs. prev_size while consolidating".
+    if (ACAP_DEVICE_Container && (!app || cJSON_GetObjectItem(app, "device") != ACAP_DEVICE_Container)) {
+        cJSON_Delete(ACAP_DEVICE_Container);
+    }
+    ACAP_DEVICE_Container = NULL;
+
 	LOG_TRACE("%s:",__func__);
     if (app) {
         cJSON_Delete(app);
         app = NULL;
-    }
-    
-    if (ACAP_DEVICE_Container) {
-        cJSON_Delete(ACAP_DEVICE_Container);
-        ACAP_DEVICE_Container = NULL;
     }
     
     http_node_count = 0;
