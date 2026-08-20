@@ -264,6 +264,18 @@ The About page shows:
 
 ## History
 
+### 3.1.2
+Video encoding on cameras with limited memory:
+- Fixed exports, previews and archives still failing with "out of memory" on some cameras after 3.1.1. The encoder kept a queue of look-ahead frames and a set of B-frame references, each one a full-resolution copy of the picture; on a 4K recording that alone was several hundred megabytes. Encoding now keeps only what it needs, which cuts peak memory by more than half at the same quality.
+- Added an automatic fallback for cameras that still cannot encode at the captured resolution. The app now checks free memory before encoding and, if the full-size encode does not fit, assembles the video at half or quarter size instead of failing. Captured images are always kept at full resolution on the SD card - only the assembled video is scaled, and the choice is made once per recording so playback stays consistent. The system log states the chosen size.
+- If the encoder is killed anyway, the app now retries once at a smaller size instead of repeating the same failing encode every time the recording is played.
+
+Archiving:
+- Fixed the midnight archive failing with "No frame files available" for busy recordings. Once every captured image has been folded into the recording video, no image files are left on disk - the archive is now made from the recording video itself instead of reporting an empty recording.
+
+Location:
+- Fixed "Error storing GeoLocation" when saving sunrise/sunset settings. The camera's stored location text was sent to the device without escaping, so a location name containing a space or a national character made the request invalid. The camera's own reason for rejecting a location is now written to the system log.
+
 ### 3.1.1
 Playback and user interface:
 - Fixed archived recordings not playing: the progress dialog stayed on screen and blocked the player. Archives are finished MP4 files, so they now open directly in the player with no progress dialog.

@@ -1150,15 +1150,54 @@ cJSON* GetLocationData() {
     return locationData;
 }
 
-void AppendQueryParameter(char* query, const char* key, const char* value) {
-    // If the query string is not empty, add an '&' separator
-    if (strlen(query) > 0) {
-        strcat(query, "&");
+/* Percent-encodes everything that is not an unreserved URI character. The location
+   "text" is free-form device configuration - a space or a non-ASCII character in it
+   (a room name, an address) went into the request line verbatim and the CGI answered
+   with an error, which surfaced as "Error storing GeoLocation" with no further clue. */
+static void AppendQueryParameterEncoded(char* query, size_t query_size, const char* key, const char* value) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t length = strlen(query);
+
+    if (!key || !value) {
+        return;
     }
-    // Append the key=value pair to the query string
-    strcat(query, key);
-    strcat(query, "=");
-    strcat(query, value);
+
+    if (length > 0) {
+        if (length + 1 >= query_size) {
+            return;
+        }
+        query[length++] = '&';
+    }
+
+    size_t key_len = strlen(key);
+    if (length + key_len + 1 >= query_size) {
+        query[length] = '\0';
+        return;
+    }
+    memcpy(query + length, key, key_len);
+    length += key_len;
+    query[length++] = '=';
+
+    for (const unsigned char* p = (const unsigned char*)value; *p; p++) {
+        unsigned char c = *p;
+        int unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                         (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+        if (unreserved) {
+            if (length + 1 >= query_size) {
+                break;
+            }
+            query[length++] = (char)c;
+        } else {
+            if (length + 3 >= query_size) {
+                break;
+            }
+            query[length++] = '%';
+            query[length++] = hex[(c >> 4) & 0x0F];
+            query[length++] = hex[c & 0x0F];
+        }
+    }
+
+    query[length] = '\0';
 }
 
 void FormatCoordinates(double lat, double lon, char* latBuffer, size_t latSize, char* lonBuffer, size_t lonSize) {
@@ -1186,26 +1225,28 @@ int SetLocationData(cJSON* location) {
     if (lat && lon && !cJSON_IsNull(lat) && !cJSON_IsNull(lon)) {
         // Format latitude and longitude according to the API requirements
         FormatCoordinates(lat->valuedouble, lon->valuedouble, latBuffer, sizeof(latBuffer), lonBuffer, sizeof(lonBuffer));
-        AppendQueryParameter(query, "lat", latBuffer);
-        AppendQueryParameter(query, "lng", lonBuffer);
+        AppendQueryParameterEncoded(query, sizeof(query), "lat", latBuffer);
+        AppendQueryParameterEncoded(query, sizeof(query), "lng", lonBuffer);
     }
 
     // Check and append "heading" if present
     cJSON* heading = cJSON_GetObjectItem(location, "heading");
     if (heading && !cJSON_IsNull(heading)) {
         snprintf(valueBuffer, sizeof(valueBuffer), "%d", heading->valueint);
-        AppendQueryParameter(query, "heading", valueBuffer);
+        AppendQueryParameterEncoded(query, sizeof(query), "heading", valueBuffer);
     }
 
-    // Check and append "text" if present
+    /* Only send a location text when there is one. An empty "text=" is not the same
+       request as omitting it, and it is not what the caller means either - this is a
+       coordinate update, the existing free-text tag should be left alone. */
     cJSON* text = cJSON_GetObjectItem(location, "text");
-    if (text && !cJSON_IsNull(text)) {
-        AppendQueryParameter(query, "text", text->valuestring);
+    if (text && cJSON_IsString(text) && text->valuestring && text->valuestring[0]) {
+        AppendQueryParameterEncoded(query, sizeof(query), "text", text->valuestring);
     }
 
     // If no parameters were added, return an error
     if (strlen(query) == 0) {
-        fprintf(stderr, "%s: No valid parameters to set.\n", __func__);
+        LOG_WARN("%s: No valid parameters to set\n", __func__);
         return 0; // Indicate failure
     }
 
@@ -1222,13 +1263,14 @@ int SetLocationData(cJSON* location) {
             free(xmlResponse); // Free response memory if dynamically allocated
             return 1;          // Success
         } else {
-            fprintf(stderr, "%s: Error in response: %s\n", __func__, xmlResponse);
+            // The device's own error text is the only thing that says why - keep it in syslog.
+            LOG_WARN("%s: %s rejected: %s\n", __func__, url, xmlResponse);
             free(xmlResponse); // Free response memory if dynamically allocated
             return 0;          // Failure
         }
     }
 
-    fprintf(stderr, "%s: Failed to contact API.\n", __func__);
+    LOG_WARN("%s: no response from %s\n", __func__, url);
     return 0; // Indicate failure due to no response
 }
 
