@@ -12,7 +12,8 @@
 #define LOG_WARN(fmt, args...) { syslog(LOG_WARNING, fmt, ## args); printf(fmt, ## args); }
 
 static cJSON* recording_state = NULL;
-static GMutex recording_mutex;
+/* Recursive: capture takes the lock and then calls helpers that take it too. */
+static GRecMutex recording_mutex;
 
 static void set_number(cJSON* object, const char* name, double value) {
     cJSON* item = cJSON_GetObjectItem(object, name);
@@ -108,25 +109,40 @@ static int ensure_profile_frame_dirs(const char* profile_id) {
 }
 
 int recording_store_init(void) {
+    g_rec_mutex_lock(&recording_mutex);
     if (recording_state) {
         cJSON_Delete(recording_state);
     }
     recording_state = load_state();
-    return recording_state != NULL;
+    int ok = recording_state != NULL;
+    g_rec_mutex_unlock(&recording_mutex);
+    return ok;
 }
 
-cJSON* recording_store_list(void) {
+/* Caller must hold recording_mutex. */
+static cJSON* recording_state_locked(void) {
     if (!recording_state) {
-        recording_store_init();
+        recording_state = load_state();
     }
     return recording_state;
 }
 
-cJSON* recording_store_get(const char* profile_id) {
+cJSON* recording_store_snapshot(void) {
+    g_rec_mutex_lock(&recording_mutex);
+    cJSON* copy = cJSON_Duplicate(recording_state_locked(), 1);
+    g_rec_mutex_unlock(&recording_mutex);
+    return copy ? copy : cJSON_CreateObject();
+}
+
+cJSON* recording_store_get_copy(const char* profile_id) {
     if (!profile_id) {
         return NULL;
     }
-    return cJSON_GetObjectItem(recording_store_list(), profile_id);
+    g_rec_mutex_lock(&recording_mutex);
+    cJSON* recording = cJSON_GetObjectItem(recording_state_locked(), profile_id);
+    cJSON* copy = recording ? cJSON_Duplicate(recording, 1) : NULL;
+    g_rec_mutex_unlock(&recording_mutex);
+    return copy;
 }
 
 int recording_store_capture_profile(cJSON* profile) {
@@ -140,20 +156,20 @@ int recording_store_capture_profile(cJSON* profile) {
         return 0;
     }
 
-    g_mutex_lock(&recording_mutex);
+    g_rec_mutex_lock(&recording_mutex);
 
     if (!ensure_profile_frame_dirs(profile_id)) {
-        g_mutex_unlock(&recording_mutex);
+        g_rec_mutex_unlock(&recording_mutex);
         return 0;
     }
 
     JpegFrame frame;
     if (!capture_snapshot(profile, &frame)) {
-        g_mutex_unlock(&recording_mutex);
+        g_rec_mutex_unlock(&recording_mutex);
         return 0;
     }
 
-    cJSON* state = recording_store_list();
+    cJSON* state = recording_state_locked();
     cJSON* recording = cJSON_GetObjectItem(state, profile_id);
     if (!recording) {
         recording = cJSON_CreateObject();
@@ -174,7 +190,7 @@ int recording_store_capture_profile(cJSON* profile) {
     if (!storage_frame_path(frame_path, sizeof(frame_path), profile_id, next_frame)) {
         LOG_WARN("%s: Failed to build frame path for %s\n", __func__, profile_id);
         capture_frame_free(&frame);
-        g_mutex_unlock(&recording_mutex);
+        g_rec_mutex_unlock(&recording_mutex);
         return 0;
     }
 
@@ -182,7 +198,7 @@ int recording_store_capture_profile(cJSON* profile) {
     if (!file) {
         LOG_WARN("%s: Failed to open frame path %s\n", __func__, frame_path);
         capture_frame_free(&frame);
-        g_mutex_unlock(&recording_mutex);
+        g_rec_mutex_unlock(&recording_mutex);
         return 0;
     }
 
@@ -191,7 +207,7 @@ int recording_store_capture_profile(cJSON* profile) {
     if (written != frame.size) {
         LOG_WARN("%s: Failed to write complete frame %s\n", __func__, frame_path);
         capture_frame_free(&frame);
-        g_mutex_unlock(&recording_mutex);
+        g_rec_mutex_unlock(&recording_mutex);
         return 0;
     }
 
@@ -213,7 +229,7 @@ int recording_store_capture_profile(cJSON* profile) {
 
     capture_frame_free(&frame);
     int saved = save_state();
-    g_mutex_unlock(&recording_mutex);
+    g_rec_mutex_unlock(&recording_mutex);
     return saved;
 }
 
@@ -222,30 +238,30 @@ int recording_store_clear(const char* profile_id) {
         return 0;
     }
 
-    g_mutex_lock(&recording_mutex);
+    g_rec_mutex_lock(&recording_mutex);
 
     char profile_dir[1024];
     if (storage_profile_dir(profile_dir, sizeof(profile_dir), profile_id)) {
         if (!storage_remove_tree(profile_dir)) {
             LOG_WARN("%s: Failed to purge profile directory %s\n", __func__, profile_dir);
-            g_mutex_unlock(&recording_mutex);
+            g_rec_mutex_unlock(&recording_mutex);
             return 0;
         }
     }
 
-    cJSON_DeleteItemFromObject(recording_store_list(), profile_id);
+    cJSON_DeleteItemFromObject(recording_state_locked(), profile_id);
     int saved = save_state();
-    g_mutex_unlock(&recording_mutex);
+    g_rec_mutex_unlock(&recording_mutex);
     return saved;
 }
 
 int recording_store_reset(void) {
-    g_mutex_lock(&recording_mutex);
+    g_rec_mutex_lock(&recording_mutex);
     if (recording_state) {
         cJSON_Delete(recording_state);
     }
     recording_state = cJSON_CreateObject();
     int saved = save_state();
-    g_mutex_unlock(&recording_mutex);
+    g_rec_mutex_unlock(&recording_mutex);
     return saved;
 }

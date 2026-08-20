@@ -186,10 +186,8 @@ int main(void) {
 
     // Create and run the main loop
 	main_loop = g_main_loop_new(NULL, FALSE);
-	GMainContext *context = g_main_loop_get_context(main_loop);
 
     LOG("Entering main loop\n");
-	main_loop = g_main_loop_new(NULL, FALSE);
     GSource *signal_source = g_unix_signal_source_new(SIGTERM);
     if (signal_source) {
 		g_source_set_callback(signal_source, signal_handler, NULL, NULL);
