@@ -12,6 +12,7 @@ CAMERAS=(
     back.internal
     driveway.internal
     parking.internal
+    bullet.internal
 )
 
 if [[ -z "${PACKAGE}" ]]; then

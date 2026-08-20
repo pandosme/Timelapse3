@@ -3,6 +3,8 @@
 #include <errno.h>
 #include <glib.h>
 #include <signal.h>
+#include <poll.h>
+#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -273,8 +275,15 @@ static int is_x264_encoder(const char* encoder_name) {
 #define ENCODE_MEM_BASE_MB 70
 #define ENCODE_MEM_PER_MPIXEL_MB 30
 /* Left for everything else on the device while ffmpeg runs: this app, the capture
-   thread's own buffers, and whatever the camera's own pipeline needs. */
-#define ENCODE_MEM_HEADROOM_MB 64
+   thread's own buffers, and whatever the camera's own pipeline needs. 64 MB was not
+   enough of a margin on a 1 GB camera - the device that rebooted under an encode had
+   40 MB free and its swap already spent - and the cost of being conservative here is a
+   smaller video, against a camera that restarts. */
+#define ENCODE_MEM_HEADROOM_MB 128
+/* How much of the budget an encode may use before finishing is still worth reporting.
+   Below this it is routine; above it, the next encode of a slightly longer sequence on a
+   slightly busier device is the one that gets stopped. */
+#define ENCODE_MEM_NEAR_BUDGET_PERCENT 60
 /* Floor for the automatic downscale. Below this the timelapse stops being worth
    looking at, and a video nobody wants is no better than the failed encode it replaced. */
 #define ENCODE_MIN_WIDTH 640
@@ -397,6 +406,217 @@ static const char* describe_child_failure(gint wait_status, const char* stderr_t
     snprintf(buf, buf_len, "exit status %d",
              WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : wait_status);
     return buf;
+}
+
+/* Picking a resolution up front is a guess, and on these devices it was a guess that
+   still ended in reboots. A field report from a 1 GB camera has an ffmpeg child at
+   613 MB RSS with swap exhausted, and what died was not the child: AXIS OS watches the
+   system with custodio, which pings by fork+exec'ing /usr/bin/ls every five seconds,
+   so once memory pressure makes that time out the hardware watchdog fires and the whole
+   camera restarts ("custodio: would have triggered OOM", then "Kernel panic - not
+   syncing: watchdog pretimeout event"). The estimate that chose the resolution was off
+   by 4x for that encode, and no constant tuned against a lab measurement fixes that on
+   every device and every load.
+
+   So the child is watched while it runs. It is killed by us - early, at a size the
+   device can still absorb - when it grows past the budget, or when MemAvailable for the
+   whole device drops toward the point where a fork starts to fail. Killing our own
+   encode costs one video; letting the watchdog fire costs the camera and every other
+   app on it. Every ffmpeg the app starts goes through here, not just the encoder: the
+   copy, concat and re-encode passes handle the same footage and were never protected.
+
+   Being stopped by the guard is reported like the kernel's own SIGKILL, so the callers
+   that retry at a smaller resolution still do. */
+#define MEM_GUARD_POLL_MS 250
+/* Device-wide floor. Below this, the next fork+exec on the device is at risk - which is
+   the failure that takes the camera down rather than just the encode. */
+#define MEM_GUARD_MIN_AVAILABLE_MB 128
+/* One sample below the floor can be a page-cache trough while a large file is written;
+   two in a row is the device actually running out. */
+#define MEM_GUARD_LOW_SAMPLES 2
+/* An ffmpeg error is a line or two; anything past this is a stuck loop repeating itself
+   and there is no reason to hold it all in memory - least of all in this app, while the
+   device is short of memory. */
+#define FFMPEG_STDERR_MAX 8192
+
+typedef struct {
+    gint wait_status;    // raw wait status, as g_spawn_sync would have reported it
+    gchar* stderr_text;  // owned by the caller, free with g_free
+    int guard_killed;    // the guard stopped it, the kernel did not
+    int peak_rss_mb;     // VmHWM of the child, 0 when it could not be read
+} FfmpegRun;
+
+static void free_ffmpeg_run(FfmpegRun* run) {
+    if (run && run->stderr_text) {
+        g_free(run->stderr_text);
+        run->stderr_text = NULL;
+    }
+}
+
+static int ffmpeg_run_succeeded(const FfmpegRun* run) {
+    return run && WIFEXITED(run->wait_status) && WEXITSTATUS(run->wait_status) == 0;
+}
+
+static long read_proc_status_kb(pid_t pid, const char* key) {
+    char path[64];
+    if (snprintf(path, sizeof(path), "/proc/%d/status", (int)pid) <= 0) {
+        return 0;
+    }
+
+    FILE* file = fopen(path, "r");
+    if (!file) {
+        return 0;
+    }
+
+    size_t key_len = strlen(key);
+    long value_kb = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        if (strncmp(line, key, key_len) == 0 && line[key_len] == ':') {
+            value_kb = strtol(line + key_len + 1, NULL, 10);
+            break;
+        }
+    }
+    fclose(file);
+    return value_kb;
+}
+
+/* Runs between fork and exec, so only async-signal-safe calls belong here. The address
+   space cap is a backstop for what the 250 ms poll cannot see: an allocation burst that
+   starts and finishes between two samples. It is deliberately loose - the field report
+   above shows 1.0 GB of address space behind 613 MB of RSS, mostly thread stacks and
+   allocator arenas that are never faulted in - because a cap that bites a healthy encode
+   costs a video for nothing. */
+typedef struct {
+    rlim_t address_space_bytes;
+} ChildLimits;
+
+static void apply_child_limits(gpointer user_data) {
+    const ChildLimits* limits = (const ChildLimits*)user_data;
+    if (!limits || limits->address_space_bytes == 0) {
+        return;
+    }
+    struct rlimit limit = { limits->address_space_bytes, limits->address_space_bytes };
+    setrlimit(RLIMIT_AS, &limit);
+}
+
+/* One sample of a running child against what the device can still spare. Returns non-zero
+   when this child has to go: either it is over the budget its resolution was chosen for,
+   or the device as a whole is close enough to empty that the next fork could fail.
+   low_samples and peak_kb carry state across calls and belong to one child. */
+static int memory_guard_should_stop(pid_t pid, int budget_mb, const char* what,
+                                    int* low_samples, long* peak_kb) {
+    long rss_kb = read_proc_status_kb(pid, "VmRSS");
+    long hwm_kb = read_proc_status_kb(pid, "VmHWM");
+    if (peak_kb && hwm_kb > *peak_kb) {
+        *peak_kb = hwm_kb;
+    }
+
+    long available_mb = read_meminfo_kb("MemAvailable") / 1024;
+    int over_budget = budget_mb > 0 && (rss_kb / 1024) > budget_mb;
+    int device_low = available_mb > 0 && available_mb < MEM_GUARD_MIN_AVAILABLE_MB;
+    if (low_samples) {
+        *low_samples = device_low ? *low_samples + 1 : 0;
+    }
+
+    int sustained_low = low_samples && *low_samples >= MEM_GUARD_LOW_SAMPLES;
+    if (!over_budget && !sustained_low) {
+        return 0;
+    }
+
+    LOG_WARN("%s: stopping %s before the device runs out reason=%s rss_mb=%ld peak_mb=%ld budget_mb=%d available_mb=%ld\n",
+             __func__, what ? what : "ffmpeg", over_budget ? "over-budget" : "device-low",
+             rss_kb / 1024, peak_kb ? *peak_kb / 1024 : 0, budget_mb, available_mb);
+    return 1;
+}
+
+/* Drop-in for g_spawn_sync() with the memory guard attached. budget_mb <= 0 watches the
+   device floor only, which is what the short metadata passes want - they have no
+   resolution to scale down and no budget of their own. */
+static gboolean run_ffmpeg_guarded(char** argv, int budget_mb, const char* what,
+                                   FfmpegRun* run, GError** error) {
+    memset(run, 0, sizeof(*run));
+
+    ChildLimits limits = { 0 };
+    if (budget_mb > 0) {
+        limits.address_space_bytes = (rlim_t)budget_mb * 2 * 1024 * 1024;
+    }
+
+    GPid child_pid = 0;
+    gint stderr_fd = -1;
+    if (!g_spawn_async_with_pipes(NULL, argv, NULL,
+                                  G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL,
+                                  apply_child_limits, &limits, &child_pid,
+                                  NULL, NULL, &stderr_fd, error)) {
+        return FALSE;
+    }
+
+    GString* stderr_buffer = g_string_new(NULL);
+    long peak_rss_kb = 0;
+    int low_memory_samples = 0;
+    int reaped = 0;
+    gint wait_status = 0;
+
+    while (!reaped || stderr_fd >= 0) {
+        if (stderr_fd >= 0) {
+            struct pollfd poll_fd = { stderr_fd, POLLIN, 0 };
+            if (poll(&poll_fd, 1, MEM_GUARD_POLL_MS) > 0) {
+                char buffer[512];
+                ssize_t got = read(stderr_fd, buffer, sizeof(buffer));
+                if (got > 0) {
+                    if (stderr_buffer->len < FFMPEG_STDERR_MAX) {
+                        g_string_append_len(stderr_buffer, buffer, got);
+                    }
+                } else if (got == 0 || (errno != EINTR && errno != EAGAIN)) {
+                    close(stderr_fd);
+                    stderr_fd = -1;
+                }
+            }
+        } else {
+            struct timespec nap = { 0, MEM_GUARD_POLL_MS * 1000000L };
+            nanosleep(&nap, NULL);
+        }
+
+        if (reaped) {
+            continue;
+        }
+
+        if (memory_guard_should_stop((pid_t)child_pid, budget_mb, what,
+                                     &low_memory_samples, &peak_rss_kb) && !run->guard_killed) {
+            run->guard_killed = 1;
+            kill((pid_t)child_pid, SIGKILL);
+        }
+
+        pid_t finished = waitpid((pid_t)child_pid, &wait_status, WNOHANG);
+        if (finished == (pid_t)child_pid) {
+            reaped = 1;
+        } else if (finished < 0 && errno != EINTR) {
+            wait_status = -1;
+            reaped = 1;
+        }
+    }
+
+    if (stderr_fd >= 0) {
+        close(stderr_fd);
+    }
+    g_spawn_close_pid(child_pid);
+
+    run->wait_status = wait_status;
+    run->peak_rss_mb = (int)(peak_rss_kb / 1024);
+    run->stderr_text = g_string_free(stderr_buffer, FALSE);
+    return TRUE;
+}
+
+/* Same job as describe_child_failure, plus the one failure the kernel never reports
+   because it never happened: the guard got there first. */
+static const char* describe_ffmpeg_failure(const FfmpegRun* run, int budget_mb,
+                                           char* buf, size_t buf_len) {
+    if (run->guard_killed) {
+        snprintf(buf, buf_len, "stopped to protect device memory (peak %d MB, budget %d MB)",
+                 run->peak_rss_mb, budget_mb);
+        return buf;
+    }
+    return describe_child_failure(run->wait_status, run->stderr_text, buf, buf_len);
 }
 
 /* The v4l2 encoder device either exists on this product or it never will, so
@@ -938,20 +1158,18 @@ static int remux_copy_video(const char* input_path, const char* output_path) {
     };
 
     GError* error = NULL;
-    gchar* stderr_text = NULL;
-    gint wait_status = 0;
-    gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
-                               NULL, &stderr_text, &wait_status, &error);
-    if (!ok || !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+    FfmpegRun run;
+    int budget_mb = encode_memory_budget_mb();
+    gboolean ok = run_ffmpeg_guarded(argv, budget_mb, "archive copy", &run, &error);
+    if (!ok || !ffmpeg_run_succeeded(&run)) {
         char failure_buf[512];
         set_last_error("Archive copy failed: %s",
                        !ok ? (error ? error->message : "spawn failed")
-                           : describe_child_failure(wait_status, stderr_text,
-                                                    failure_buf, sizeof(failure_buf)));
+                           : describe_ffmpeg_failure(&run, budget_mb, failure_buf, sizeof(failure_buf)));
         if (error) {
             g_error_free(error);
         }
-        g_free(stderr_text);
+        free_ffmpeg_run(&run);
         unlink(temp_path);
         return 0;
     }
@@ -959,7 +1177,7 @@ static int remux_copy_video(const char* input_path, const char* output_path) {
     if (error) {
         g_error_free(error);
     }
-    g_free(stderr_text);
+    free_ffmpeg_run(&run);
 
     if (rename(temp_path, output_path) == -1) {
         set_last_error("Failed to finalize archive copy: %s", strerror(errno));
@@ -1292,16 +1510,15 @@ retry_encode:
         unlink(temp_path);
 
         GError* error = NULL;
-        gchar* stderr_text = NULL;
-        gint wait_status = 0;
+        FfmpegRun run;
+        int budget_mb = encode_memory_budget_mb();
         long long ffmpeg_started_ms = monotonic_ms();
         LOG("%s: ffmpeg try kind=%s profile=%s encoder=%s input=%s output=%s fps=%s start=%s frames=%s preset=%s crf=%s gop=%s faststart=%s scale=%s mem_budget_mb=%d\n",
             __func__, media_kind_name(kind), profile_id, encoder, input_pattern, output_path,
             fps_arg, start_number_arg, frame_count_arg, preset, crf, gop_arg, use_faststart ? "on" : "off",
-            use_scale ? scale_arg : "native", encode_memory_budget_mb());
+            use_scale ? scale_arg : "native", budget_mb);
 
-        gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
-                                   NULL, &stderr_text, &wait_status, &error);
+        gboolean ok = run_ffmpeg_guarded(argv, budget_mb, "encode", &run, &error);
         int last_candidate = (i + 1 == candidate_count);
         if (!ok) {
             snprintf(final_error, sizeof(final_error), "spawn failed: %s", error ? error->message : "unknown error");
@@ -1316,43 +1533,60 @@ retry_encode:
             if (error) {
                 g_error_free(error);
             }
-            g_free(stderr_text);
+            free_ffmpeg_run(&run);
             continue;
         }
 
-        if (!WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+        if (!ffmpeg_run_succeeded(&run)) {
             char failure_buf[512];
-            const char* failure = describe_child_failure(wait_status, stderr_text,
-                                                         failure_buf, sizeof(failure_buf));
+            const char* failure = describe_ffmpeg_failure(&run, budget_mb, failure_buf, sizeof(failure_buf));
             snprintf(final_error, sizeof(final_error), "%s", failure);
-            encode_killed = WIFSIGNALED(wait_status) && WTERMSIG(wait_status) == SIGKILL;
-            if (use_hw && hw_encoder_missing_device(stderr_text)) {
+            /* Both endings mean the same thing to the retry below: this resolution does
+               not fit on this device. The guard version is the one we want to see - it
+               got there before the kernel had to choose a victim. */
+            encode_killed = run.guard_killed ||
+                            (WIFSIGNALED(run.wait_status) && WTERMSIG(run.wait_status) == SIGKILL);
+            if (use_hw && hw_encoder_missing_device(run.stderr_text)) {
                 g_atomic_int_set(&hw_encoder_unavailable, 1);
                 LOG("%s: encoder %s has no device on this product; skipping it from now on\n",
                     __func__, encoder);
             }
             if (last_candidate) {
-                LOG_WARN("%s: ffmpeg failed kind=%s profile=%s encoder=%s wait_status=%d elapsed_ms=%lld err=%s\n",
-                         __func__, media_kind_name(kind), profile_id, encoder, wait_status,
-                         monotonic_ms() - ffmpeg_started_ms, failure);
+                LOG_WARN("%s: ffmpeg failed kind=%s profile=%s encoder=%s wait_status=%d peak_rss_mb=%d elapsed_ms=%lld err=%s\n",
+                         __func__, media_kind_name(kind), profile_id, encoder, run.wait_status,
+                         run.peak_rss_mb, monotonic_ms() - ffmpeg_started_ms, failure);
             } else {
                 LOG("%s: encoder %s failed, falling back to next candidate\n", __func__, encoder);
             }
-            g_free(stderr_text);
+            free_ffmpeg_run(&run);
             continue;
         }
 
-        g_free(stderr_text);
         encode_ok = 1;
-        LOG("%s: ffmpeg success kind=%s profile=%s encoder=%s elapsed_ms=%lld\n",
-            __func__, media_kind_name(kind), profile_id, encoder, monotonic_ms() - ffmpeg_started_ms);
+        /* The measured peak, logged on every success: the numbers this app scales by were
+           fitted to a handful of lab encodes, and this is the only way the real ones from
+           real devices ever come back. */
+        LOG("%s: ffmpeg success kind=%s profile=%s encoder=%s peak_rss_mb=%d budget_mb=%d elapsed_ms=%lld\n",
+            __func__, media_kind_name(kind), profile_id, encoder, run.peak_rss_mb, budget_mb,
+            monotonic_ms() - ffmpeg_started_ms);
+        /* An encode that finished but came close is the warning shot before the one that
+           does not, and it is the only version of this number that leaves the camera:
+           these devices forward warnings and above to the syslog server, so an info line
+           is visible on the device alone. */
+        if (budget_mb > 0 && run.peak_rss_mb > (budget_mb * ENCODE_MEM_NEAR_BUDGET_PERCENT) / 100) {
+            LOG_WARN("%s: encode came close to the memory budget kind=%s profile=%s peak_rss_mb=%d budget_mb=%d scale=%s\n",
+                     __func__, media_kind_name(kind), profile_id, run.peak_rss_mb, budget_mb,
+                     use_scale ? scale_arg : "native");
+        }
+        free_ffmpeg_run(&run);
         break;
     }
 
-    /* SIGKILL with no stderr is the kernel reclaiming memory, and the memory an encode
-       needs is set by the frame size. The estimate that picked this resolution is a model,
-       not a measurement of this device under this load - so when it is wrong, halve and
-       try once more rather than handing the user a failure they cannot act on. */
+    /* Killed - by the guard above, or by the kernel when it got there first - means the
+       memory an encode needs at this frame size does not fit on this device. The estimate
+       that picked the resolution is a model, not a measurement of this device under this
+       load, so when it is wrong, halve and try once more rather than handing the user a
+       failure they cannot act on. */
     if (!encode_ok && encode_killed && !oom_retry_used && !scale_locked &&
         halve_encode_dims(profile_id, scale_arg, sizeof(scale_arg), &use_scale)) {
         oom_retry_used = 1;
@@ -1437,19 +1671,19 @@ retry_encode:
         };
 
         GError* concat_error = NULL;
-        gchar* concat_stderr = NULL;
-        gint concat_wait_status = 0;
-        gboolean concat_ok = g_spawn_sync(NULL, concat_argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
-                                          NULL, &concat_stderr, &concat_wait_status, &concat_error);
+        FfmpegRun concat_run;
+        int concat_budget_mb = encode_memory_budget_mb();
+        gboolean concat_ok = run_ffmpeg_guarded(concat_argv, concat_budget_mb, "merge",
+                                                &concat_run, &concat_error);
         unlink(concat_list_path);
         unlink(temp_path);
 
-        if (!concat_ok || !WIFEXITED(concat_wait_status) || WEXITSTATUS(concat_wait_status) != 0) {
+        if (!concat_ok || !ffmpeg_run_succeeded(&concat_run)) {
             char concat_failure_buf[512];
             const char* concat_failure = !concat_ok
                 ? (concat_error ? concat_error->message : "spawn failed")
-                : describe_child_failure(concat_wait_status, concat_stderr,
-                                         concat_failure_buf, sizeof(concat_failure_buf));
+                : describe_ffmpeg_failure(&concat_run, concat_budget_mb,
+                                          concat_failure_buf, sizeof(concat_failure_buf));
             if (media_job) {
                 set_media_encode_status_done(0, "Video merge failed");
             }
@@ -1457,7 +1691,7 @@ retry_encode:
             if (concat_error) {
                 g_error_free(concat_error);
             }
-            g_free(concat_stderr);
+            free_ffmpeg_run(&concat_run);
             unlink(concat_output_path);
             g_mutex_unlock(&encode_mutex);
             return 0;
@@ -1466,7 +1700,7 @@ retry_encode:
         if (concat_error) {
             g_error_free(concat_error);
         }
-        g_free(concat_stderr);
+        free_ffmpeg_run(&concat_run);
 
         if (rename(concat_output_path, output_path) == -1) {
             if (media_job) {
@@ -1755,24 +1989,22 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
     tail_argv[tail_argc] = NULL;
 
     GError* error = NULL;
-    gchar* stderr_text = NULL;
-    gint wait_status = 0;
+    FfmpegRun run;
+    int budget_mb = encode_memory_budget_mb();
     long long tail_started_ms = monotonic_ms();
-    LOG("%s: tail encode profile=%s start=%s frames=%s scale=%s\n", __func__, profile_id,
-        start_number_arg, frame_count_arg, use_scale ? scale_arg : "native");
-    gboolean ok = g_spawn_sync(NULL, tail_argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
-                               NULL, &stderr_text, &wait_status, &error);
-    if (!ok || !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+    LOG("%s: tail encode profile=%s start=%s frames=%s scale=%s mem_budget_mb=%d\n", __func__, profile_id,
+        start_number_arg, frame_count_arg, use_scale ? scale_arg : "native", budget_mb);
+    gboolean ok = run_ffmpeg_guarded(tail_argv, budget_mb, "preview encode", &run, &error);
+    if (!ok || !ffmpeg_run_succeeded(&run)) {
         char failure_buf[512];
         set_last_error("Preview encode failed: %s",
                        !ok ? (error ? error->message : "spawn failed")
-                           : describe_child_failure(wait_status, stderr_text,
-                                                    failure_buf, sizeof(failure_buf)));
+                           : describe_ffmpeg_failure(&run, budget_mb, failure_buf, sizeof(failure_buf)));
         LOG_WARN("%s: tail encode failed profile=%s err=%s\n", __func__, profile_id, last_error);
         if (error) {
             g_error_free(error);
         }
-        g_free(stderr_text);
+        free_ffmpeg_run(&run);
         unlink(tail_path);
         g_mutex_unlock(&encode_mutex);
         return 0;
@@ -1780,8 +2012,9 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
     if (error) {
         g_error_free(error);
     }
-    g_free(stderr_text);
-    LOG("%s: tail encode done profile=%s elapsed_ms=%lld\n", __func__, profile_id, monotonic_ms() - tail_started_ms);
+    LOG("%s: tail encode done profile=%s peak_rss_mb=%d elapsed_ms=%lld\n", __func__, profile_id,
+        run.peak_rss_mb, monotonic_ms() - tail_started_ms);
+    free_ffmpeg_run(&run);
 
     if (!base_path) {
         // No base to build on yet (first-ever preview for this profile) - the tail is the
@@ -1851,23 +2084,23 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
         };
 
         GError* concat_error = NULL;
-        gchar* concat_stderr = NULL;
-        gint concat_wait_status = 0;
-        gboolean concat_ok = g_spawn_sync(NULL, concat_argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
-                                          NULL, &concat_stderr, &concat_wait_status, &concat_error);
+        FfmpegRun concat_run;
+        int concat_budget_mb = encode_memory_budget_mb();
+        gboolean concat_ok = run_ffmpeg_guarded(concat_argv, concat_budget_mb, "merge",
+                                                &concat_run, &concat_error);
         unlink(concat_list_path);
         unlink(tail_path);
 
-        if (!concat_ok || !WIFEXITED(concat_wait_status) || WEXITSTATUS(concat_wait_status) != 0) {
+        if (!concat_ok || !ffmpeg_run_succeeded(&concat_run)) {
             char concat_failure_buf[512];
             set_last_error("Preview merge failed: %s",
                            !concat_ok ? (concat_error ? concat_error->message : "spawn failed")
-                                      : describe_child_failure(concat_wait_status, concat_stderr,
-                                                               concat_failure_buf, sizeof(concat_failure_buf)));
+                                      : describe_ffmpeg_failure(&concat_run, concat_budget_mb,
+                                                                concat_failure_buf, sizeof(concat_failure_buf)));
             if (concat_error) {
                 g_error_free(concat_error);
             }
-            g_free(concat_stderr);
+            free_ffmpeg_run(&concat_run);
             unlink(concat_output_path);
             g_mutex_unlock(&encode_mutex);
             return 0;
@@ -1875,7 +2108,7 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
         if (concat_error) {
             g_error_free(concat_error);
         }
-        g_free(concat_stderr);
+        free_ffmpeg_run(&concat_run);
 
         // Only now safe to replace the real preview_path - ffmpeg has finished reading
         // base_path, even in the case where that was the old preview_path itself.
@@ -1988,6 +2221,11 @@ static gint64 probe_media_duration_us(const char* input_path) {
         "-hide_banner",
         "-i",
         (char*)input_path,
+        /* Only the header is wanted here. Without "-c copy" this decoded every frame of
+           the file - minutes of CPU and a decoder's worth of memory, on a device that has
+           neither to spare - to learn a number ffmpeg prints before the first frame. */
+        "-c",
+        "copy",
         "-f",
         "null",
         "-",
@@ -1995,14 +2233,13 @@ static gint64 probe_media_duration_us(const char* input_path) {
     };
 
     GError* spawn_error = NULL;
-    gchar* stderr_text = NULL;
-    gint wait_status = 0;
-    gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
-                              NULL, &stderr_text, &wait_status, &spawn_error);
+    FfmpegRun run;
+    gboolean ok = run_ffmpeg_guarded(argv, 0, "duration probe", &run, &spawn_error);
     if (spawn_error) {
         g_error_free(spawn_error);
     }
 
+    gchar* stderr_text = run.stderr_text;
     gint64 duration_us = 0;
     if (ok && stderr_text) {
         char* duration = strstr(stderr_text, "Duration:");
@@ -2015,7 +2252,7 @@ static gint64 probe_media_duration_us(const char* input_path) {
         }
     }
 
-    g_free(stderr_text);
+    free_ffmpeg_run(&run);
     return duration_us;
 }
 
@@ -2080,7 +2317,15 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
     gint stdout_fd = -1;
     gint stderr_fd = -1;
     GPid child_pid = 0;
-    gboolean ok = g_spawn_async_with_pipes(NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL,
+    /* Same guard as every other ffmpeg here, sampled off the progress lines this one
+       already reads rather than a poll loop of its own. */
+    int budget_mb = encode_memory_budget_mb();
+    int low_memory_samples = 0;
+    long peak_rss_kb = 0;
+    int guard_killed = 0;
+    ChildLimits limits = { budget_mb > 0 ? (rlim_t)budget_mb * 2 * 1024 * 1024 : 0 };
+    gboolean ok = g_spawn_async_with_pipes(NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD,
+                                          apply_child_limits, &limits,
                                           &child_pid, NULL, &stdout_fd, &stderr_fd, &spawn_error);
     if (!ok) {
         set_last_error("FFmpeg AVI migration failed: %s", spawn_error ? spawn_error->message : "unknown error");
@@ -2104,6 +2349,12 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
         }
 
         if (g_str_has_prefix(line, "out_time_ms=")) {
+            if (memory_guard_should_stop(child_pid, budget_mb, "AVI migration",
+                                         &low_memory_samples, &peak_rss_kb)) {
+                guard_killed = 1;
+                kill(child_pid, SIGKILL);
+                break;
+            }
             gint64 out_time_us = g_ascii_strtoll(line + strlen("out_time_ms="), NULL, 10);
             double percent = duration_us > 0 ? ((double)out_time_us * 100.0) / (double)duration_us : 0.0;
             if (percent < 1.0) percent = 1.0;
@@ -2145,6 +2396,20 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
     waitpid(child_pid, &wait_status, 0);
     g_spawn_close_pid(child_pid);
     stderr_text = g_string_free(stderr_buffer, FALSE);
+
+    if (guard_killed) {
+        char guard_detail[128];
+        snprintf(guard_detail, sizeof(guard_detail), "peak %d MB, budget %d MB",
+                 (int)(peak_rss_kb / 1024), budget_mb);
+        set_last_error("AVI migration stopped to protect device memory (%s)", guard_detail);
+        if (spawn_error) {
+            g_error_free(spawn_error);
+        }
+        g_free(stderr_text);
+        unlink(temp_path);
+        g_mutex_unlock(&encode_mutex);
+        return 0;
+    }
 
     if (cancelled) {
         set_last_error("%s", "Migration cancelled.");
@@ -2327,22 +2592,23 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
     };
 
     GError* error = NULL;
-    gchar* stderr_text = NULL;
-    gint wait_status = 0;
-    gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL,
-                               NULL, &stderr_text, &wait_status, &error);
+    FfmpegRun run;
+    /* This one both decodes and encodes the whole export, at whatever resolution it was
+       written in, so it is the heaviest thing the app runs - and until now the only heavy
+       one with nothing watching it. */
+    int budget_mb = encode_memory_budget_mb();
+    gboolean ok = run_ffmpeg_guarded(argv, budget_mb, "fps re-encode", &run, &error);
 
-    if (!ok || !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+    if (!ok || !ffmpeg_run_succeeded(&run)) {
         char failure_buf[512];
         set_reencode_status_done(0, "Re-encode failed");
         set_last_error("Failed to re-encode export: %s",
                        !ok ? (error ? error->message : "spawn failed")
-                           : describe_child_failure(wait_status, stderr_text,
-                                                    failure_buf, sizeof(failure_buf)));
+                           : describe_ffmpeg_failure(&run, budget_mb, failure_buf, sizeof(failure_buf)));
         if (error) {
             g_error_free(error);
         }
-        g_free(stderr_text);
+        free_ffmpeg_run(&run);
         unlink(new_temp);
         return 0;
     }
@@ -2350,7 +2616,7 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
     if (error) {
         g_error_free(error);
     }
-    g_free(stderr_text);
+    free_ffmpeg_run(&run);
 
     if (rename(new_temp, new_path) == -1) {
         set_reencode_status_done(0, "Failed finalizing output");
