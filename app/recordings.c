@@ -1738,6 +1738,10 @@ static void HTTP_Endpoint_Download(const ACAP_HTTP_Response response, const ACAP
         ACAP_HTTP_Respond_Error(response, 400, "Missing filename parameter");
         return;
     }
+    if (!storage_name_is_safe(filename)) {
+        ACAP_HTTP_Respond_Error(response, 400, "Invalid filename parameter");
+        return;
+    }
     const char* inline_param = ACAP_HTTP_Request_Param(request, "inline");
 
     char filepath[PATH_MAX_LEN];

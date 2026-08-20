@@ -228,8 +228,30 @@ int storage_reset(char* error, size_t error_len) {
     return storage_ensure_root(error, error_len);
 }
 
+/* Anything that arrives from an HTTP parameter and ends up as a path component has to
+   pass here first. A profile id or a filename is one name, never a path: "../.." walked
+   out of the storage tree entirely, which for the delete paths means removing a directory
+   that has nothing to do with this app. */
+int storage_name_is_safe(const char* name) {
+    if (!name || !name[0]) {
+        return 0;
+    }
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return 0;
+    }
+    for (const unsigned char* c = (const unsigned char*)name; *c; c++) {
+        if (*c == '/' || *c == '\\' || *c < 0x20) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int storage_profile_dir(char* out, size_t out_len, const char* profile_id) {
     char profiles_dir[1024];
+    if (!storage_name_is_safe(profile_id)) {
+        return 0;
+    }
     if (!storage_profiles_dir(profiles_dir, sizeof(profiles_dir))) {
         return 0;
     }

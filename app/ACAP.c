@@ -545,6 +545,30 @@ cleanup:
  * HTTP Request Parameter Handling Implementation
  *------------------------------------------------------------------*/
 
+/* Query strings and form bodies arrive percent-encoded; nothing here decoded them, so a
+   value with any reserved or non-ASCII byte in it never matched what the app had stored -
+   a recording id that was not plain ASCII could not be addressed at all. Decodes in place:
+   the result only ever shrinks. "+" is a space in both forms, by the same convention that
+   encoded it. */
+static void http_param_decode(char* value) {
+    if (!value) {
+        return;
+    }
+
+    char* out = value;
+    for (const char* in = value; *in; in++) {
+        if (*in == '+') {
+            *out++ = ' ';
+        } else if (*in == '%' && g_ascii_isxdigit(in[1]) && g_ascii_isxdigit(in[2])) {
+            *out++ = (char)((g_ascii_xdigit_value(in[1]) << 4) | g_ascii_xdigit_value(in[2]));
+            in += 2;
+        } else {
+            *out++ = *in;
+        }
+    }
+    *out = '\0';
+}
+
 const char* ACAP_HTTP_Request_Param(const ACAP_HTTP_Request request, const char* name) {
     if (!request || !request->request || !name) {
         LOG_WARN("Invalid request parameters\n");
@@ -572,6 +596,7 @@ const char* ACAP_HTTP_Request_Param(const ACAP_HTTP_Request request, const char*
                 
                 strncpy(result, found, len);
                 result[len] = '\0';
+                http_param_decode(result);
                 return result;  // Caller must free this
             }
         }
@@ -603,6 +628,7 @@ const char* ACAP_HTTP_Request_Param(const ACAP_HTTP_Request request, const char*
             
             strncpy(result, start, len);
             result[len] = '\0';
+            http_param_decode(result);
             return result;  // Caller must free this
         }
     }
