@@ -20,6 +20,7 @@
 #include "migration.h"
 #include "sunevents.h"
 #include "storage.h"
+#include "media.h"
 #include <sys/statvfs.h>
 
 #define APP_PACKAGE "timelapse2"
@@ -69,15 +70,30 @@ HTTP_Endpoint_Reset(const ACAP_HTTP_Response response,
                               const ACAP_HTTP_Request request) {
 	LOG("Resetting everything\n");
 
+	if (!media_job_try_admit()) {
+		ACAP_HTTP_Respond_Error(response, 409, "A media operation is already running");
+		return;
+	}
+
+	media_storage_transaction_lock();
+	media_exclusive_lock();
+	Timelapse_Pause();
+
     char error_message[256];
     if (!storage_reset(error_message, sizeof(error_message))) {
         LOG_WARN("%s: %s\n", __func__, error_message);
+		media_exclusive_unlock();
+		media_storage_transaction_unlock();
+		media_job_release();
         ACAP_HTTP_Respond_Error(response, 500, error_message);
         return;
     }
 
-	Timelapse_Reset();
 	Recordings_Reset();
+	Timelapse_Reset();
+	media_exclusive_unlock();
+	media_storage_transaction_unlock();
+	media_job_release();
 	LOG("Everythin reset\n");
     ACAP_HTTP_Respond_Text(response, "OK");
 }
@@ -110,6 +126,7 @@ static void migration_complete(void) {
 static gboolean
 signal_handler(gpointer user_data) {
     LOG("Received SIGTERM, initiating shutdown\n");
+	ACAP_Request_Shutdown();
     if (main_loop && g_main_loop_is_running(main_loop)) {
         g_main_loop_quit(main_loop);
     }

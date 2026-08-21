@@ -12,6 +12,7 @@ typedef void (*Timelapse_Callback)(cJSON* profile);
 int		Timelapse_Init( Timelapse_Callback callback );
 int 	Timelapse_Save_Profiles(void);
 void	Timelapse_Reset(void);
+void	Timelapse_Pause(void);
 int		Timelapse_Remove_Profile_By_Id( const char* id );
 
 /* The profile store is shared between the GLib main thread, the FastCGI thread

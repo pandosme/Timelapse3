@@ -59,7 +59,10 @@ cJSON*		ACAP(const char* package, ACAP_Config_Update updateCallback);
 const char* ACAP_Name(void);
 int 		ACAP_Set_Config(const char* service, cJSON* serviceSettings);
 cJSON* 		ACAP_Get_Config(const char* service);
+cJSON* 		ACAP_Get_Config_Copy(const char* service);
 void		ACAP_Cleanup(void);
+void		ACAP_Request_Shutdown(void);
+int		ACAP_Shutdown_Requested(void);
 
 // Tracks detached background GThreads (Reset/Refresh/Archive/Preview media jobs, the hourly
 // chunk sweep, fps re-encode, AVI migration - anything spawned "fire and forget" via
@@ -70,7 +73,7 @@ void		ACAP_Cleanup(void);
 // under it - see AGENTS.md for the crash this fixes.
 void		ACAP_Background_Job_Begin(void);
 void		ACAP_Background_Job_End(void);
-void		ACAP_Background_Jobs_Wait(int timeout_ms);
+int		ACAP_Background_Jobs_Wait(int timeout_ms);
 
 /*-----------------------------------------------------
  * HTTP Functions
@@ -152,8 +155,8 @@ cJSON* 		ACAP_STATUS_Group(const char* name);
 int 		ACAP_STATUS_Bool(const char* group, const char* name);
 int 		ACAP_STATUS_Int(const char* group, const char* name);
 double 		ACAP_STATUS_Double(const char* group, const char* name);
-char* 		ACAP_STATUS_String(const char* group, const char* name);
-cJSON* 		ACAP_STATUS_Object(const char* group, const char* name);
+char* 		ACAP_STATUS_String(const char* group, const char* name); /* owned; g_free() */
+cJSON* 		ACAP_STATUS_Object(const char* group, const char* name); /* owned copy */
 
 // Status setters
 void		ACAP_STATUS_SetBool(const char* group, const char* name, int state);

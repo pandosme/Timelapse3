@@ -6,11 +6,14 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "storage.h"
 
 static char active_storage_root[1024];
 static int active_storage_root_initialized = 0;
+static pthread_mutex_t storage_root_mutex = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local char storage_root_snapshot[1024];
 
 static int build_uid_storage_root(char* out, size_t out_len) {
     uid_t uid = geteuid();
@@ -31,10 +34,13 @@ static int set_error(char* error, size_t error_len, const char* fmt, const char*
 }
 
 const char* storage_root(void) {
+    pthread_mutex_lock(&storage_root_mutex);
     if (!active_storage_root_initialized) {
         snprintf(active_storage_root, sizeof(active_storage_root), "%s", STORAGE_ROOT);
     }
-    return active_storage_root;
+    snprintf(storage_root_snapshot, sizeof(storage_root_snapshot), "%s", active_storage_root);
+    pthread_mutex_unlock(&storage_root_mutex);
+    return storage_root_snapshot;
 }
 
 static int ensure_root_candidate(const char* candidate, char* error, size_t error_len) {
@@ -73,7 +79,11 @@ int storage_join(char* out, size_t out_len, const char* first, const char* secon
     return written > 0 && (size_t)written < out_len;
 }
 
-int storage_ensure_root(char* error, size_t error_len) {
+static int storage_ensure_root_unlocked(char* error, size_t error_len) {
+    if (active_storage_root_initialized) {
+        return ensure_root_candidate(active_storage_root, error, error_len);
+    }
+
     const char* env_root = getenv("STORAGE_ROOT");
     if (env_root && env_root[0]) {
         char env_error[256];
@@ -151,6 +161,13 @@ int storage_ensure_root(char* error, size_t error_len) {
     return 0;
 }
 
+int storage_ensure_root(char* error, size_t error_len) {
+    pthread_mutex_lock(&storage_root_mutex);
+    int result = storage_ensure_root_unlocked(error, error_len);
+    pthread_mutex_unlock(&storage_root_mutex);
+    return result;
+}
+
 int storage_ensure_directory(const char* path, char* error, size_t error_len) {
     struct stat st;
 
@@ -221,6 +238,9 @@ int storage_remove_tree(const char* path) {
 }
 
 int storage_reset(char* error, size_t error_len) {
+    if (!storage_ensure_root(error, error_len)) {
+        return 0;
+    }
     const char* root = storage_root();
     if (!storage_remove_tree(root)) {
         return set_error(error, error_len, "Failed to remove storage tree: %s (%s)", root);

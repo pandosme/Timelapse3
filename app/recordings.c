@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <syslog.h>
@@ -170,6 +171,7 @@ static void Set_Reset_Media_Status_Done(int ok, const char* message) {
 static gpointer Reset_Media_Thread(gpointer user_data) {
     ResetMediaTask* task = (ResetMediaTask*)user_data;
     if (!task) {
+        media_job_release();
         ACAP_Background_Job_End();
         return NULL;
     }
@@ -185,6 +187,7 @@ static gpointer Reset_Media_Thread(gpointer user_data) {
     }
 
     g_free(task);
+    media_job_release();
     ACAP_Background_Job_End();
     return NULL;
 }
@@ -193,9 +196,13 @@ static int Queue_Reset_Media(const char* profile_id) {
     if (!profile_id || !profile_id[0]) {
         return 0;
     }
+    if (!media_job_try_admit()) {
+        return 0;
+    }
 
     ResetMediaTask* task = g_new0(ResetMediaTask, 1);
     if (!task) {
+        media_job_release();
         return 0;
     }
 
@@ -207,6 +214,7 @@ static int Queue_Reset_Media(const char* profile_id) {
     if (!thread) {
         ACAP_Background_Job_End();
         g_free(task);
+        media_job_release();
         Set_Reset_Media_Status_Done(0, "Failed to start media reset");
         return 0;
     }
@@ -264,6 +272,7 @@ static void Set_Refresh_Status_Done(int ok, const char* message) {
 static gpointer Refresh_Media_Thread(gpointer user_data) {
     RefreshTask* task = (RefreshTask*)user_data;
     if (!task) {
+        media_job_release();
         ACAP_Background_Job_End();
         return NULL;
     }
@@ -279,6 +288,7 @@ static gpointer Refresh_Media_Thread(gpointer user_data) {
     }
 
     g_free(task);
+    media_job_release();
     ACAP_Background_Job_End();
     return NULL;
 }
@@ -287,9 +297,13 @@ static int Queue_Refresh_Media(const char* profile_id, int fps) {
     if (!profile_id || !profile_id[0]) {
         return 0;
     }
+    if (!media_job_try_admit()) {
+        return 0;
+    }
 
     RefreshTask* task = g_new0(RefreshTask, 1);
     if (!task) {
+        media_job_release();
         return 0;
     }
 
@@ -302,6 +316,7 @@ static int Queue_Refresh_Media(const char* profile_id, int fps) {
     if (!thread) {
         ACAP_Background_Job_End();
         g_free(task);
+        media_job_release();
         Set_Refresh_Status_Done(0, "Failed to start refresh");
         return 0;
     }
@@ -329,24 +344,76 @@ static void Set_Archive_Status_Done(int ok, const char* message) {
     ACAP_STATUS_SetString("mediaJob", "message", message ? message : (ok ? "Recording archived" : "Archive failed"));
 }
 
+/* generate_mp4() takes encode_mutex with a trylock, so an archive asked for while the hourly
+   sweep is mid-batch fails on the spot with "already running" - and a sweep on a large recording
+   holds that lock for minutes (front: an export whose ffmpeg alone ran 127s, and the merge after
+   it longer still). Both callers therefore wait rather than fail: what the encoder is busy with
+   will finish, and an archive that is a few minutes late is an archive.
+
+   The two differ only in how long they are willing to wait and whether anyone is watching: a
+   person who pressed Archive gets the wait reported and a shorter limit, the midnight run has
+   nobody watching and a whole night. */
+static int archive_waiting_for_encoder(const char* profile_id, int attempts, int interval_s,
+                                       int report_progress, const char* who) {
+    int result = -1;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        if (ACAP_Shutdown_Requested()) {
+            return -1;
+        }
+        result = Recordings_Archive(profile_id);
+        if (result == 0 || !strstr(media_last_error(), "already running")) {
+            return result;
+        }
+
+        if (attempt + 1 >= attempts) {
+            break;
+        }
+
+        LOG_WARN("%s: encode busy, waiting %ds profile=%s attempt=%d/%d\n", who, interval_s,
+                 profile_id, attempt + 1, attempts);
+        if (report_progress) {
+            // Otherwise the dialog reads "Processing..." while nothing appears to happen.
+            ACAP_STATUS_SetString("mediaJob", "stage", "Waiting for the encoder to finish");
+        }
+        for (int elapsed_ms = 0; elapsed_ms < interval_s * 1000; elapsed_ms += 100) {
+            if (ACAP_Shutdown_Requested()) {
+                return -1;
+            }
+            g_usleep(100 * 1000);
+        }
+    }
+    return result;
+}
+
+// A person is waiting on this one, so it gives up after 10 minutes rather than an hour - but it
+// does wait. Failing instantly is what made "Archive" look broken when the only thing wrong was
+// that housekeeping had the encoder.
+#define ARCHIVE_MANUAL_RETRY_ATTEMPTS 40
+#define ARCHIVE_MANUAL_RETRY_INTERVAL_S 15
+
 static gpointer Archive_Media_Thread(gpointer user_data) {
     ArchiveTask* task = (ArchiveTask*)user_data;
     if (!task) {
+        media_job_release();
         ACAP_Background_Job_End();
         return NULL;
     }
 
     LOG("%s: start profile=%s\n", __func__, task->profile_id);
-    int result = Recordings_Archive(task->profile_id);
+    int result = archive_waiting_for_encoder(task->profile_id, ARCHIVE_MANUAL_RETRY_ATTEMPTS,
+                                             ARCHIVE_MANUAL_RETRY_INTERVAL_S, 1, __func__);
     if (result == 0) {
         LOG("%s: done profile=%s\n", __func__, task->profile_id);
         Set_Archive_Status_Done(1, "Recording archived");
     } else {
         LOG_WARN("%s: failed profile=%s err=%s\n", __func__, task->profile_id, media_last_error());
-        Set_Archive_Status_Done(0, "Failed to archive recording");
+        Set_Archive_Status_Done(0, strstr(media_last_error(), "already running")
+                                       ? "The camera is still busy building video. Try again shortly."
+                                       : "Failed to archive recording");
     }
 
     g_free(task);
+    media_job_release();
     ACAP_Background_Job_End();
     return NULL;
 }
@@ -355,9 +422,13 @@ static int Queue_Archive_Media(const char* profile_id) {
     if (!profile_id || !profile_id[0]) {
         return 0;
     }
+    if (!media_job_try_admit()) {
+        return 0;
+    }
 
     ArchiveTask* task = g_new0(ArchiveTask, 1);
     if (!task) {
+        media_job_release();
         return 0;
     }
 
@@ -369,6 +440,7 @@ static int Queue_Archive_Media(const char* profile_id) {
     if (!thread) {
         ACAP_Background_Job_End();
         g_free(task);
+        media_job_release();
         Set_Archive_Status_Done(0, "Failed to start archive");
         return 0;
     }
@@ -407,18 +479,23 @@ static gpointer Midnight_Archive_Thread(gpointer user_data) {
         return NULL;
     }
 
-    for (guint i = 0; i < profile_ids->len; i++) {
-        const char* profile_id = (const char*)g_ptr_array_index(profile_ids, i);
-        int result = -1;
-        for (int attempt = 0; attempt < ARCHIVE_BUSY_RETRY_ATTEMPTS; attempt++) {
-            result = Recordings_Archive(profile_id);
-            if (result == 0 || !strstr(media_last_error(), "already running")) {
-                break;
-            }
-            LOG_WARN("%s: encode busy, waiting %ds profile=%s attempt=%d/%d\n", __func__,
-                     ARCHIVE_BUSY_RETRY_INTERVAL_S, profile_id, attempt + 1, ARCHIVE_BUSY_RETRY_ATTEMPTS);
-            g_usleep((gulong)ARCHIVE_BUSY_RETRY_INTERVAL_S * G_USEC_PER_SEC);
+    while (!media_job_try_admit()) {
+        if (ACAP_Shutdown_Requested()) {
+            g_ptr_array_free(profile_ids, TRUE);
+            g_atomic_int_set(&midnight_archive_active, 0);
+            ACAP_Background_Job_End();
+            return NULL;
         }
+        g_usleep(100 * 1000);
+    }
+
+    for (guint i = 0; i < profile_ids->len; i++) {
+        if (ACAP_Shutdown_Requested()) {
+            break;
+        }
+        const char* profile_id = (const char*)g_ptr_array_index(profile_ids, i);
+        int result = archive_waiting_for_encoder(profile_id, ARCHIVE_BUSY_RETRY_ATTEMPTS,
+                                                 ARCHIVE_BUSY_RETRY_INTERVAL_S, 0, __func__);
         if (result == 0) {
             LOG("%s: archived profile=%s\n", __func__, profile_id);
         } else {
@@ -427,6 +504,7 @@ static gpointer Midnight_Archive_Thread(gpointer user_data) {
     }
 
     g_ptr_array_free(profile_ids, TRUE);
+    media_job_release();
     g_atomic_int_set(&midnight_archive_active, 0);
     ACAP_Background_Job_End();
     return NULL;
@@ -456,6 +534,7 @@ static void Set_Preview_Status_Done(int ok, const char* message) {
 static gpointer Preview_Media_Thread(gpointer user_data) {
     PreviewTask* task = (PreviewTask*)user_data;
     if (!task) {
+        media_job_release();
         ACAP_Background_Job_End();
         return NULL;
     }
@@ -472,6 +551,7 @@ static gpointer Preview_Media_Thread(gpointer user_data) {
     }
 
     g_free(task);
+    media_job_release();
     ACAP_Background_Job_End();
     return NULL;
 }
@@ -484,9 +564,13 @@ static int Queue_Preview_Media(const char* profile_id, int fps) {
     if (!profile_id || !profile_id[0]) {
         return 0;
     }
+    if (!media_job_try_admit()) {
+        return 0;
+    }
 
     PreviewTask* task = g_new0(PreviewTask, 1);
     if (!task) {
+        media_job_release();
         return 0;
     }
 
@@ -499,6 +583,7 @@ static int Queue_Preview_Media(const char* profile_id, int fps) {
     if (!thread) {
         ACAP_Background_Job_End();
         g_free(task);
+        media_job_release();
         Set_Preview_Status_Done(0, "Failed to start preview");
         return 0;
     }
@@ -810,12 +895,13 @@ static void save_archive_list() {
 static void Retention_Cleanup() {
     // Get retention period from settings
     int retentionMonths = 12;
-    cJSON* settings = ACAP_Get_Config("settings");
+    cJSON* settings = ACAP_Get_Config_Copy("settings");
     if (settings && cJSON_GetObjectItem(settings, "retentionMonths")) {
         retentionMonths = cJSON_GetObjectItem(settings, "retentionMonths")->valueint;
     } else {
 		LOG_WARN("%s: Invalid settings retentionMonths configuration\n",__func__);
 	}
+    cJSON_Delete(settings);
 
 
     // Get current time
@@ -913,7 +999,9 @@ static int recording_due_for_archive(const char* profile_id, cJSON* recording, G
 }
 
 int Recordings_Clear(const char* profileId) {
+    media_exclusive_lock();
     int result = recording_store_clear(profileId);
+    media_exclusive_unlock();
     return result ? 0 : -1;
 }
 
@@ -1053,6 +1141,13 @@ static int stream_file_response(const ACAP_HTTP_Response response, const ACAP_HT
         return 0;
     }
 
+    // FastCGI exposes no public per-request timeout API. Bound writes on the accepted
+    // connection so a client that stops reading cannot make shutdown wait forever.
+    if (response && response->ipcFd >= 0) {
+        struct timeval send_timeout = { .tv_sec = 2, .tv_usec = 0 };
+        setsockopt(response->ipcFd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+    }
+
     fseek(file, 0, SEEK_END);
     long long file_size = (long long)ftell(file);
     fseek(file, 0, SEEK_SET);
@@ -1128,6 +1223,11 @@ static int stream_file_response(const ACAP_HTTP_Response response, const ACAP_HT
     long long bytes_sent = 0;
     long long remaining = send_bytes;
     while (remaining > 0) {
+        if (ACAP_Shutdown_Requested()) {
+            LOG("%s: shutdown interrupted stream path=%s bytes_sent=%lld\n",
+                __func__, path ? path : "(null)", bytes_sent);
+            break;
+        }
         size_t want = remaining < 65536 ? (size_t)remaining : 65536;
         bytes_read = fread(buffer, 1, want, file);
         if (bytes_read == 0) {
@@ -1165,7 +1265,7 @@ int Recordings_Capture(cJSON* profile) {
     return result ? 0 : -1;
 }
 
-int Recordings_Archive(const char *profileID) {
+static int Recordings_Archive_Impl(const char *profileID) {
     char archivePath[PATH_MAX_LEN];
     char archiveFilename[PATH_MAX_LEN];
     char archiveFullPath[PATH_MAX_LEN];
@@ -1216,7 +1316,13 @@ int Recordings_Archive(const char *profileID) {
     cJSON_Delete(profile);
 
     time_t now = time(NULL);
-    struct tm *timeinfo = localtime(&now);
+    struct tm local_time;
+    struct tm *timeinfo = localtime_r(&now, &local_time);
+    if (!timeinfo) {
+        LOG_WARN("%s: Failed to resolve local archive time\n", __func__);
+        cJSON_Delete(recordingMetadata);
+        return -1;
+    }
     snprintf(archiveFilename, sizeof(archiveFilename),
              "%s_%04d_%02d_%02d_%02d%02d.mp4",
              sanitizedProfileName,
@@ -1282,19 +1388,39 @@ int Recordings_Archive(const char *profileID) {
     save_archive_list();
     g_rec_mutex_unlock(&archive_list_mutex);
 
+    int archived_frames = imagesItem->valueint;
+    double archived_last = lastItem->valuedouble;
     cJSON_Delete(recordingMetadata);
 
     // Update profile archived timestamp. Goes through the store so the profile
     // tree is only ever touched under its lock - see the note in timelapse.c.
     Timelapse_Set_Profile_Number(profileID, "archived", ACAP_DEVICE_Timestamp());
 
-    // Clear original recording
-    Recordings_Clear(profileID);
+    // A capture can land while ffmpeg is building the archive. Only clear the exact
+    // generation represented by the metadata above; otherwise retain the live recording
+    // so frames captured during the encode are never deleted without being archived.
+    media_exclusive_lock();
+    int clear_result = recording_store_clear_if_unchanged(profileID, archived_frames, archived_last);
+    media_exclusive_unlock();
+    if (clear_result == 0) {
+        LOG("%s: retained live recording because captures arrived during archive profile=%s\n",
+            __func__, profileID);
+    } else if (clear_result < 0) {
+        LOG_WARN("%s: archive succeeded but live recording cleanup failed profile=%s\n",
+                 __func__, profileID);
+    }
 
     LOG("%s: success profile=%s file=%s size=%lld elapsed_ms=%lld\n",
         __func__, profileID, archiveFilename, (long long)archiveStat.st_size, monotonic_ms() - started_ms);
 	//pthread_mutex_unlock(&recordings_mutex);
     return 0;
+}
+
+int Recordings_Archive(const char *profileID) {
+    media_storage_transaction_lock();
+    int result = Recordings_Archive_Impl(profileID);
+    media_storage_transaction_unlock();
+    return result;
 }
 
 int Recordings_Delete_Archive(const char* filename) {
@@ -1346,9 +1472,12 @@ int Recordings_Delete_Archive(const char* filename) {
 }
 
 int Recordings_Delete_Profile_Media(const char* profileId) {
-    if (!profileId) {
+    if (!profileId || !media_job_try_admit()) {
         return 0;
     }
+
+    media_storage_transaction_lock();
+    media_exclusive_lock();
 
     g_rec_mutex_lock(&archive_list_mutex);
 
@@ -1360,6 +1489,9 @@ int Recordings_Delete_Profile_Media(const char* profileId) {
     cJSON* newArchiveList = cJSON_CreateArray();
     if (!newArchiveList) {
         g_rec_mutex_unlock(&archive_list_mutex);
+        media_exclusive_unlock();
+        media_storage_transaction_unlock();
+        media_job_release();
         return 0;
     }
 
@@ -1393,7 +1525,10 @@ int Recordings_Delete_Profile_Media(const char* profileId) {
 
     g_rec_mutex_unlock(&archive_list_mutex);
 
-    int clear_ok = Recordings_Clear(profileId) == 0;
+    int clear_ok = recording_store_clear(profileId);
+    media_exclusive_unlock();
+    media_storage_transaction_unlock();
+    media_job_release();
     LOG("%s: profile=%s clear=%s removed_archives=%d\n",
         __func__, profileId, clear_ok ? "ok" : "failed", removed_archives);
     return clear_ok;
@@ -1513,11 +1648,19 @@ static void HTTP_Endpoint_Export(const ACAP_HTTP_Response response,
     // be used - a click either prepares (PUT) or fetches (GET), never both in one request.
     struct stat export_stat;
     int export_exists = stat(output_path, &export_stat) == 0 && S_ISREG(export_stat.st_mode) && export_stat.st_size > 0;
-    if (!export_exists && !media_process_pending_force(profileId, fps)) {
-        int status = media_ffmpeg_available() ? 500 : 503;
-        LOG_WARN("%s: failed profile=%s fps=%d status=%d err=%s\n", __func__, profileId, fps, status, media_last_error());
-        ACAP_HTTP_Respond_Error(response, status, media_last_error());
-        return;
+    if (!export_exists) {
+        if (!media_job_try_admit()) {
+            ACAP_HTTP_Respond_Error(response, 409, "Another media operation is already running");
+            return;
+        }
+        int generated = media_process_pending_force(profileId, fps);
+        media_job_release();
+        if (!generated) {
+            int status = media_ffmpeg_available() ? 500 : 503;
+            LOG_WARN("%s: failed profile=%s fps=%d status=%d err=%s\n", __func__, profileId, fps, status, media_last_error());
+            ACAP_HTTP_Respond_Error(response, status, media_last_error());
+            return;
+        }
     }
 
     LOG("%s: generated profile=%s fps=%d path=%s elapsed_ms=%lld\n", __func__, profileId, fps, output_path, monotonic_ms() - started_ms);
@@ -1568,8 +1711,16 @@ static void HTTP_Endpoint_Video(const ACAP_HTTP_Response response, const ACAP_HT
     // while the job runs" churn this avoids). Only fall back to building here for a direct GET
     // with no preceding PUT (bookmark, API caller, old page).
     char output_path[PATH_MAX_LEN];
-    if (!media_generate_preview(profileId, fps, output_path, sizeof(output_path), 0) &&
-        !media_generate_preview(profileId, fps, output_path, sizeof(output_path), 1)) {
+    int preview_ready = media_generate_preview(profileId, fps, output_path, sizeof(output_path), 0);
+    if (!preview_ready) {
+        if (!media_job_try_admit()) {
+            ACAP_HTTP_Respond_Error(response, 409, "Another media operation is already running");
+            return;
+        }
+        preview_ready = media_generate_preview(profileId, fps, output_path, sizeof(output_path), 1);
+        media_job_release();
+    }
+    if (!preview_ready) {
         int status = media_ffmpeg_available() ? 500 : 503;
         LOG_WARN("%s: failed profile=%s fps=%d status=%d err=%s\n", __func__, profileId, fps, status, media_last_error());
         ACAP_HTTP_Respond_Error(response, status, media_last_error());
@@ -1823,6 +1974,9 @@ LOG_TRACE("Midnight check: %d:%d", hour, minute);
     GPtrArray* due_profile_ids = g_ptr_array_new_with_free_func(g_free);
     cJSON *recordings = Recordings_Get_List();
     for (cJSON *recording = recordings->child; recording; recording = recording->next) {
+        if (ACAP_Shutdown_Requested() || media_job_is_active()) {
+            break;
+        }
         if (recording_due_for_archive(recording->string, recording, now)) {
             g_ptr_array_add(due_profile_ids, g_strdup(recording->string));
         }
@@ -1918,7 +2072,7 @@ static int inside_midnight_archive_window(void) {
 
 static gboolean process_chunks_hourly(gpointer user_data) {
     (void)user_data;
-    if (g_atomic_int_get(&midnight_archive_active) || inside_midnight_archive_window()) {
+    if (media_job_is_active() || g_atomic_int_get(&midnight_archive_active) || inside_midnight_archive_window()) {
         LOG("%s: archive run in progress, skipping this sweep\n", __func__);
         return TRUE;
     }

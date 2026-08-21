@@ -6,6 +6,7 @@
 int recording_store_init(void);
 int recording_store_capture_profile(cJSON* profile);
 int recording_store_clear(const char* profile_id);
+int recording_store_clear_if_unchanged(const char* profile_id, int expected_frames, double expected_last);
 int recording_store_reset(void);
 
 /* The recording state is written by capture on the GLib main thread and read by
