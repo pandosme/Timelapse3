@@ -384,9 +384,25 @@ static int Queue_Archive_Media(const char* profile_id) {
 // with the hourly chunk-sweep or a user-triggered Refresh/Preview/Export would otherwise make
 // Recordings_Archive() fail instantly with no retry, silently skipping that profile's archive
 // for a full 24h (recording_due_for_archive() has no memory of a prior failed attempt).
+
+// Set for as long as a midnight run is walking its profiles, including the gaps between them.
+// The hourly sweep steps aside while it is set: a sweep that starts in one of those gaps takes
+// encode_mutex for as long as its batch needs (250s on a busy recording, measured), and every
+// remaining profile of the night then fails and is skipped until tomorrow. One collision could
+// take out a whole night's batch, not just the profile that hit it.
+static gint midnight_archive_active = 0;
+
+// Nothing about an archive is urgent, it only must not be skipped: a missed night loses that
+// day's boundary for good. So it waits out whatever holds the encoder - typically a sweep that
+// started just before midnight - instead of giving up. 5 attempts 2s apart could not outlast a
+// single batch and did not.
+#define ARCHIVE_BUSY_RETRY_ATTEMPTS 30
+#define ARCHIVE_BUSY_RETRY_INTERVAL_S 60
+
 static gpointer Midnight_Archive_Thread(gpointer user_data) {
     GPtrArray* profile_ids = (GPtrArray*)user_data;
     if (!profile_ids) {
+        g_atomic_int_set(&midnight_archive_active, 0);
         ACAP_Background_Job_End();
         return NULL;
     }
@@ -394,13 +410,14 @@ static gpointer Midnight_Archive_Thread(gpointer user_data) {
     for (guint i = 0; i < profile_ids->len; i++) {
         const char* profile_id = (const char*)g_ptr_array_index(profile_ids, i);
         int result = -1;
-        for (int attempt = 0; attempt < 5; attempt++) {
+        for (int attempt = 0; attempt < ARCHIVE_BUSY_RETRY_ATTEMPTS; attempt++) {
             result = Recordings_Archive(profile_id);
             if (result == 0 || !strstr(media_last_error(), "already running")) {
                 break;
             }
-            LOG_WARN("%s: encode busy, retrying profile=%s attempt=%d\n", __func__, profile_id, attempt + 1);
-            g_usleep(2 * G_USEC_PER_SEC);
+            LOG_WARN("%s: encode busy, waiting %ds profile=%s attempt=%d/%d\n", __func__,
+                     ARCHIVE_BUSY_RETRY_INTERVAL_S, profile_id, attempt + 1, ARCHIVE_BUSY_RETRY_ATTEMPTS);
+            g_usleep((gulong)ARCHIVE_BUSY_RETRY_INTERVAL_S * G_USEC_PER_SEC);
         }
         if (result == 0) {
             LOG("%s: archived profile=%s\n", __func__, profile_id);
@@ -410,6 +427,7 @@ static gpointer Midnight_Archive_Thread(gpointer user_data) {
     }
 
     g_ptr_array_free(profile_ids, TRUE);
+    g_atomic_int_set(&midnight_archive_active, 0);
     ACAP_Background_Job_End();
     return NULL;
 }
@@ -1816,9 +1834,13 @@ LOG_TRACE("Midnight check: %d:%d", hour, minute);
         // context) for the duration, same reasoning as the other Refresh/Archive/Preview jobs
         // already backgrounded elsewhere in this file.
         ACAP_Background_Job_Begin();
+        // Before the thread exists, not inside it: the sweep tick and this run are both on the
+        // clock, and a tick that fires in between would take the encoder out from under it.
+        g_atomic_int_set(&midnight_archive_active, 1);
         GThread* thread = g_thread_new("midnight-archive", Midnight_Archive_Thread, due_profile_ids);
         if (!thread) {
             LOG_WARN("%s: failed to start midnight archive thread\n", __func__);
+            g_atomic_int_set(&midnight_archive_active, 0);
             ACAP_Background_Job_End();
             g_ptr_array_free(due_profile_ids, TRUE);
         } else {
@@ -1878,8 +1900,28 @@ static gpointer process_chunks_thread(gpointer user_data) {
 // this must not run on the main loop thread, or it blocks capture handling for every profile
 // for however long that encode takes. Runs on its own GThread instead, same reasoning as the
 // Refresh/Archive background jobs above.
+// True through the minutes around midnight. The archive run is started from a once-a-minute
+// timer, so there is a window where it is due but not yet marked active; a sweep starting in
+// that window would hold the encoder while the night's archives are being attempted. The sweep
+// loses nothing by sitting out ten minutes - its batch is deferrable by definition and the next
+// tick continues from exactly where this one would have.
+static int inside_midnight_archive_window(void) {
+    GDateTime* now = g_date_time_new_now_local();
+    if (!now) {
+        return 0;
+    }
+    int hour = g_date_time_get_hour(now);
+    int minute = g_date_time_get_minute(now);
+    g_date_time_unref(now);
+    return hour == 0 && minute < 10;
+}
+
 static gboolean process_chunks_hourly(gpointer user_data) {
     (void)user_data;
+    if (g_atomic_int_get(&midnight_archive_active) || inside_midnight_archive_window()) {
+        LOG("%s: archive run in progress, skipping this sweep\n", __func__);
+        return TRUE;
+    }
     if (g_atomic_int_compare_and_exchange(&chunk_sweep_running, 0, 1)) {
         ACAP_Background_Job_Begin();
         GThread* thread = g_thread_new("chunk-sweep", process_chunks_thread, NULL);

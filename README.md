@@ -264,6 +264,28 @@ The About page shows:
 
 ## History
 
+### 3.1.6
+Archiving:
+- Fixed the daily, weekly and monthly archive being skipped on cameras where the hourly housekeeping pass happens to run at midnight. Both jobs use the same encoder, and the archive gave up after ten seconds of finding it busy - the recording then stayed live and kept growing, in one case for two weeks. Housekeeping now steps aside while archiving is due or running, and an archive waits up to thirty minutes for the encoder instead of giving up.
+- Several recordings due on the same night are archived one after another, and housekeeping stays out of the way for the whole run. Previously a pass starting between two of them could take out every recording still waiting its turn.
+
+### 3.1.5
+Recordings and archives:
+- Fixed recordings and archived files whose name contains a space or a national character being impossible to play, download or delete. Names were compared without decoding what the browser sent, so they never matched.
+- Archive downloads now reject a file name that tries to point outside the archive folder.
+
+### 3.1.4
+Stability:
+- Fixed the app leaving a crash report behind every time it was stopped or restarted, including on upgrade. Two parts of the app freed the same block of device information at shutdown, which corrupted memory as the app exited. In rare cases the damage reached data being written at that moment: one camera had a recording entry with an unreadable name and no images, left behind by an earlier shutdown.
+
+### 3.1.3
+Video encoding on cameras with limited memory:
+- Fixed cameras rebooting during an export or archive. On a camera short of memory the encoder could take the whole device down with it, rather than simply failing: the system watchdog fires when memory pressure stops ordinary work from running, and the camera restarts, taking every other app with it. Encoding is now watched while it runs and stopped by the app - early, before the device is in trouble - after which the video is retried at a smaller size.
+- The watch covers every step that handles video, not just the first encode. Copying, joining and re-encoding recordings were unprotected and can be just as large.
+- Each finished encode now records how much memory it actually used, and one that finishes close to what the camera can spare is reported as a warning. The measurement is what tells you a recording's resolution and a camera's free memory are drifting toward each other, before it fails.
+- Changing the playback speed of a recording, and migrating recordings from Timelapse 2.x, are now covered by the same protection.
+- Reading the length of a video no longer decodes the whole file, which on a long recording took minutes of processing for a number stored in the header.
+
 ### 3.1.2
 Video encoding on cameras with limited memory:
 - Fixed exports, previews and archives still failing with "out of memory" on some cameras after 3.1.1. The encoder kept a queue of look-ahead frames and a set of B-frame references, each one a full-resolution copy of the picture; on a 4K recording that alone was several hundred megabytes. Encoding now keeps only what it needs, which cuts peak memory by more than half at the same quality.
