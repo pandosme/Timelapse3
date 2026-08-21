@@ -1,3 +1,5 @@
-deploy.sh
-
-asan-build/
+/deploy.sh
+/build/
+/asan-build/
+*.eap
+/code-analysis.md
