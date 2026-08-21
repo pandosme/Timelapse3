@@ -264,27 +264,27 @@ The About page shows:
 
 ## History
 
-### 3.1.6
-Archiving:
-- Fixed the daily, weekly and monthly archive being skipped on cameras where the hourly housekeeping pass happens to run at midnight. Both jobs use the same encoder, and the archive gave up after ten seconds of finding it busy - the recording then stayed live and kept growing, in one case for two weeks. Housekeeping now steps aside while archiving is due or running, and an archive waits up to thirty minutes for the encoder instead of giving up.
-- Several recordings due on the same night are archived one after another, and housekeeping stays out of the way for the whole run. Previously a pass starting between two of them could take out every recording still waiting its turn.
-
-### 3.1.5
-Recordings and archives:
-- Fixed recordings and archived files whose name contains a space or a national character being impossible to play, download or delete. Names were compared without decoding what the browser sent, so they never matched.
-- Archive downloads now reject a file name that tries to point outside the archive folder.
-
-### 3.1.4
-Stability:
-- Fixed the app leaving a crash report behind every time it was stopped or restarted, including on upgrade. Two parts of the app freed the same block of device information at shutdown, which corrupted memory as the app exited. In rare cases the damage reached data being written at that moment: one camera had a recording entry with an unreadable name and no images, left behind by an earlier shutdown.
-
 ### 3.1.3
-Video encoding on cameras with limited memory:
-- Fixed cameras rebooting during an export or archive. On a camera short of memory the encoder could take the whole device down with it, rather than simply failing: the system watchdog fires when memory pressure stops ordinary work from running, and the camera restarts, taking every other app with it. Encoding is now watched while it runs and stopped by the app - early, before the device is in trouble - after which the video is retried at a smaller size.
-- The watch covers every step that handles video, not just the first encode. Copying, joining and re-encoding recordings were unprotected and can be just as large.
-- Each finished encode now records how much memory it actually used, and one that finishes close to what the camera can spare is reported as a warning. The measurement is what tells you a recording's resolution and a camera's free memory are drifting toward each other, before it fails.
-- Changing the playback speed of a recording, and migrating recordings from Timelapse 2.x, are now covered by the same protection.
-- Reading the length of a video no longer decodes the whole file, which on a long recording took minutes of processing for a number stored in the header.
+Fixes four faults reported from the field, described by what you would have seen on the camera.
+
+**The camera restarted, or other apps on it stopped, while a video was being built.** On cameras
+short of memory the camera's own watchdog took the device down instead of the app simply failing;
+Timelapse now watches its memory use while building a video, stops early and rebuilds at a smaller
+size, and does so for every step that handles video rather than only the first encode.
+
+**A recording set to archive daily was never archived and kept growing, in one case to 14 days and
+10 GB.** Archiving gave up after ten seconds if the hourly housekeeping pass held the encoder, and
+the timing repeats every night on a given camera; housekeeping now stands aside for archiving, and
+an archive waits up to thirty minutes for the encoder.
+
+**The camera logged a crash from Timelapse on every stop, restart and upgrade.** Two parts of the
+app released the same block of memory at shutdown, which in rare cases also damaged data being
+written at that moment; stopping and upgrading is now clean.
+
+**Recordings and archived files with a space or a national character in the name could not be
+played, downloaded or deleted.** The name from the browser was compared without being decoded, so
+the action silently did nothing; names are decoded correctly now, and a file name pointing outside
+the archive folder is rejected.
 
 ### 3.1.2
 Video encoding on cameras with limited memory:
