@@ -329,6 +329,45 @@ static void Set_Archive_Status_Done(int ok, const char* message) {
     ACAP_STATUS_SetString("mediaJob", "message", message ? message : (ok ? "Recording archived" : "Archive failed"));
 }
 
+/* generate_mp4() takes encode_mutex with a trylock, so an archive asked for while the hourly
+   sweep is mid-batch fails on the spot with "already running" - and a sweep on a large recording
+   holds that lock for minutes (front: an export whose ffmpeg alone ran 127s, and the merge after
+   it longer still). Both callers therefore wait rather than fail: what the encoder is busy with
+   will finish, and an archive that is a few minutes late is an archive.
+
+   The two differ only in how long they are willing to wait and whether anyone is watching: a
+   person who pressed Archive gets the wait reported and a shorter limit, the midnight run has
+   nobody watching and a whole night. */
+static int archive_waiting_for_encoder(const char* profile_id, int attempts, int interval_s,
+                                       int report_progress, const char* who) {
+    int result = -1;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        result = Recordings_Archive(profile_id);
+        if (result == 0 || !strstr(media_last_error(), "already running")) {
+            return result;
+        }
+
+        if (attempt + 1 >= attempts) {
+            break;
+        }
+
+        LOG_WARN("%s: encode busy, waiting %ds profile=%s attempt=%d/%d\n", who, interval_s,
+                 profile_id, attempt + 1, attempts);
+        if (report_progress) {
+            // Otherwise the dialog reads "Processing..." while nothing appears to happen.
+            ACAP_STATUS_SetString("mediaJob", "stage", "Waiting for the encoder to finish");
+        }
+        g_usleep((gulong)interval_s * G_USEC_PER_SEC);
+    }
+    return result;
+}
+
+// A person is waiting on this one, so it gives up after 10 minutes rather than an hour - but it
+// does wait. Failing instantly is what made "Archive" look broken when the only thing wrong was
+// that housekeeping had the encoder.
+#define ARCHIVE_MANUAL_RETRY_ATTEMPTS 40
+#define ARCHIVE_MANUAL_RETRY_INTERVAL_S 15
+
 static gpointer Archive_Media_Thread(gpointer user_data) {
     ArchiveTask* task = (ArchiveTask*)user_data;
     if (!task) {
@@ -337,13 +376,16 @@ static gpointer Archive_Media_Thread(gpointer user_data) {
     }
 
     LOG("%s: start profile=%s\n", __func__, task->profile_id);
-    int result = Recordings_Archive(task->profile_id);
+    int result = archive_waiting_for_encoder(task->profile_id, ARCHIVE_MANUAL_RETRY_ATTEMPTS,
+                                             ARCHIVE_MANUAL_RETRY_INTERVAL_S, 1, __func__);
     if (result == 0) {
         LOG("%s: done profile=%s\n", __func__, task->profile_id);
         Set_Archive_Status_Done(1, "Recording archived");
     } else {
         LOG_WARN("%s: failed profile=%s err=%s\n", __func__, task->profile_id, media_last_error());
-        Set_Archive_Status_Done(0, "Failed to archive recording");
+        Set_Archive_Status_Done(0, strstr(media_last_error(), "already running")
+                                       ? "The camera is still busy building video. Try again shortly."
+                                       : "Failed to archive recording");
     }
 
     g_free(task);
@@ -409,16 +451,8 @@ static gpointer Midnight_Archive_Thread(gpointer user_data) {
 
     for (guint i = 0; i < profile_ids->len; i++) {
         const char* profile_id = (const char*)g_ptr_array_index(profile_ids, i);
-        int result = -1;
-        for (int attempt = 0; attempt < ARCHIVE_BUSY_RETRY_ATTEMPTS; attempt++) {
-            result = Recordings_Archive(profile_id);
-            if (result == 0 || !strstr(media_last_error(), "already running")) {
-                break;
-            }
-            LOG_WARN("%s: encode busy, waiting %ds profile=%s attempt=%d/%d\n", __func__,
-                     ARCHIVE_BUSY_RETRY_INTERVAL_S, profile_id, attempt + 1, ARCHIVE_BUSY_RETRY_ATTEMPTS);
-            g_usleep((gulong)ARCHIVE_BUSY_RETRY_INTERVAL_S * G_USEC_PER_SEC);
-        }
+        int result = archive_waiting_for_encoder(profile_id, ARCHIVE_BUSY_RETRY_ATTEMPTS,
+                                                 ARCHIVE_BUSY_RETRY_INTERVAL_S, 0, __func__);
         if (result == 0) {
             LOG("%s: archived profile=%s\n", __func__, profile_id);
         } else {
