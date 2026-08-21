@@ -34,6 +34,7 @@
 // Global variables
 static cJSON* app = NULL;
 static cJSON* status_container = NULL;
+static gint acap_shutting_down = 0;
 
 /* status_container is written from the GLib main thread and from the media
  * worker threads (job progress), and serialised by the FastCGI thread on every
@@ -41,6 +42,7 @@ static cJSON* status_container = NULL;
  * unsynchronised poll during a job update walks freed nodes and corrupts the
  * heap. Recursive because the Set* helpers call ACAP_STATUS_Group(). */
 static GRecMutex status_lock;
+static GRecMutex settings_lock;
 
 cJSON* 		ACAP_STATUS(void);
 static void	ACAP_HTTP_Cache_Declared_Nodes(cJSON* manifest);
@@ -155,10 +157,18 @@ ACAP_ENDPOINT_app(const ACAP_HTTP_Response response, const ACAP_HTTP_Request req
         ACAP_HTTP_Respond_Error(response, 405, "Method Not Allowed - Use GET");
         return;
     }
-    /* app carries status_container as a child, so serialise under its lock. */
+    /* app carries status_container as a child, so snapshot under its lock. */
+    g_rec_mutex_lock(&settings_lock);
     g_rec_mutex_lock(&status_lock);
-    ACAP_HTTP_Respond_JSON(response, app);
+    cJSON* snapshot = cJSON_Duplicate(app, 1);
     g_rec_mutex_unlock(&status_lock);
+    g_rec_mutex_unlock(&settings_lock);
+    if (!snapshot) {
+        ACAP_HTTP_Respond_Error(response, 500, "Failed to serialize application state");
+        return;
+    }
+    ACAP_HTTP_Respond_JSON(response, snapshot);
+    cJSON_Delete(snapshot);
 }
 
 static void
@@ -172,7 +182,15 @@ ACAP_ENDPOINT_settings(const ACAP_HTTP_Response response, const ACAP_HTTP_Reques
 
     // Handle GET request - return current settings
     if (strcmp(method, "GET") == 0) {
-        ACAP_HTTP_Respond_JSON(response, cJSON_GetObjectItem(app, "settings"));
+        g_rec_mutex_lock(&settings_lock);
+        cJSON* snapshot = cJSON_Duplicate(cJSON_GetObjectItem(app, "settings"), 1);
+        g_rec_mutex_unlock(&settings_lock);
+        if (!snapshot) {
+            ACAP_HTTP_Respond_Error(response, 500, "Failed to read settings");
+            return;
+        }
+        ACAP_HTTP_Respond_JSON(response, snapshot);
+        cJSON_Delete(snapshot);
         return;
     }
 
@@ -201,6 +219,8 @@ ACAP_ENDPOINT_settings(const ACAP_HTTP_Response response, const ACAP_HTTP_Reques
         LOG_TRACE("%s: %s\n", __func__, request->postData);
 
         // Update settings
+        g_rec_mutex_lock(&settings_lock);
+        g_rec_mutex_lock(&status_lock);
         cJSON* settings = cJSON_GetObjectItem(app, "settings");
         cJSON* param = params->child;
         while (param) {
@@ -219,6 +239,8 @@ ACAP_ENDPOINT_settings(const ACAP_HTTP_Response response, const ACAP_HTTP_Reques
         if (ACAP_UpdateCallback) {
             ACAP_UpdateCallback("settings", settings);
         }
+        g_rec_mutex_unlock(&status_lock);
+        g_rec_mutex_unlock(&settings_lock);
 
         ACAP_HTTP_Respond_Text(response, "Settings updated successfully");
         return;
@@ -254,12 +276,20 @@ ACAP_Get_Config(const char* service) {
 	return reqestedService;
 }
 
+cJSON* ACAP_Get_Config_Copy(const char* service) {
+    g_rec_mutex_lock(&settings_lock);
+    cJSON* requested_service = app ? cJSON_GetObjectItem(app, service) : NULL;
+    cJSON* copy = requested_service ? cJSON_Duplicate(requested_service, 1) : NULL;
+    g_rec_mutex_unlock(&settings_lock);
+    return copy;
+}
+
 /*------------------------------------------------------------------
  * HTTP Request Processing Implementation
  *------------------------------------------------------------------*/
 
 static pthread_t http_thread;
-static int http_thread_running = 0; // Flag to track thread state
+static gint http_thread_running = 0; // Flag to track thread state
 static pthread_mutex_t http_nodes_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
@@ -269,7 +299,7 @@ typedef struct {
 
 // Thread function for FastCGI processing
 void* fastcgi_thread_func(void* arg) {
-    while (http_thread_running) {
+    while (g_atomic_int_get(&http_thread_running)) {
         ACAP_HTTP_Process(); // Process FastCGI requests
     }
 	LOG_TRACE("%s: Exit\n",__func__);
@@ -345,7 +375,7 @@ int ACAP_HTTP() {
         initialized = 1;
 
         // Start the FastCGI thread
-        http_thread_running = 1;
+        g_atomic_int_set(&http_thread_running, 1);
         if (pthread_create(&http_thread, NULL, fastcgi_thread_func, NULL) != 0) {
             LOG_WARN("Failed to create FastCGI thread\n");
             initialized = 0; // Roll back initialization
@@ -361,16 +391,18 @@ void ACAP_HTTP_Cleanup() {
 	if(!initialized)
 		return;
 
-    // Close the FastCGI socket
-    if (fcgi_sock != -1) {
-        close(fcgi_sock);
-        fcgi_sock = -1;
-    }
-
     // Stop the FastCGI thread
-    if (http_thread_running) {
-        http_thread_running = 0; // Signal the thread to stop
-		pthread_cancel(http_thread); // Request cancellation
+    if (g_atomic_int_get(&http_thread_running)) {
+        g_atomic_int_set(&http_thread_running, 0);
+        FCGX_ShutdownPending();
+        int socket_to_close = g_atomic_int_get(&fcgi_sock);
+        while (socket_to_close != -1 &&
+               !g_atomic_int_compare_and_exchange(&fcgi_sock, socket_to_close, -1)) {
+            socket_to_close = g_atomic_int_get(&fcgi_sock);
+        }
+        if (socket_to_close != -1) {
+            close(socket_to_close);
+        }
         pthread_join(http_thread, NULL); // Wait for the thread to finish
     }
     initialized = 0;
@@ -458,17 +490,27 @@ void ACAP_HTTP_Process() {
     }
 
     // Open socket if not already open
-    if (fcgi_sock == -1) {
-        fcgi_sock = FCGX_OpenSocket(socket_path, 5);
-        if (fcgi_sock < 0) {
+    int request_socket = g_atomic_int_get(&fcgi_sock);
+    if (request_socket == -1) {
+        int opened_socket = FCGX_OpenSocket(socket_path, 5);
+        if (opened_socket < 0) {
             LOG_WARN("Failed to open FCGI socket\n");
             return;
+        }
+        if (g_atomic_int_compare_and_exchange(&fcgi_sock, -1, opened_socket)) {
+            request_socket = opened_socket;
+        } else {
+            close(opened_socket);
+            request_socket = g_atomic_int_get(&fcgi_sock);
+            if (request_socket == -1) {
+                return;
+            }
         }
         chmod(socket_path, 0777);
     }
 
     // Initialize request
-    if (FCGX_InitRequest(&request, fcgi_sock, 0) != 0) {
+    if (FCGX_InitRequest(&request, request_socket, 0) != 0) {
         LOG_WARN("FCGX_InitRequest failed\n");
         return;
     }
@@ -920,56 +962,78 @@ void ACAP_STATUS_SetNull(const char* group, const char* name) {
  *------------------------------------------------------------------*/
 
 int ACAP_STATUS_Bool(const char* group, const char* name) {
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
 		LOG_TRACE("%s: Invalid group \n",__func__);
+        g_rec_mutex_unlock(&status_lock);
         return 0;
     }
 
     cJSON* item = cJSON_GetObjectItem(groupObj, name);
 	if( !item ) {
+		g_rec_mutex_unlock(&status_lock);
 		return 0;
 	}
-    return item->type == cJSON_True?1:0;
+    int result = item->type == cJSON_True ? 1 : 0;
+    g_rec_mutex_unlock(&status_lock);
+    return result;
 }
 
 int ACAP_STATUS_Int(const char* group, const char* name) {
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
+        g_rec_mutex_unlock(&status_lock);
         return 0;
     }
 
     cJSON* item = cJSON_GetObjectItem(groupObj, name);
-    return item && cJSON_IsNumber(item) ? item->valueint : 0;
+    int result = item && cJSON_IsNumber(item) ? item->valueint : 0;
+    g_rec_mutex_unlock(&status_lock);
+    return result;
 }
 
 double ACAP_STATUS_Double(const char* group, const char* name) {
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
+        g_rec_mutex_unlock(&status_lock);
         return 0.0;
     }
 
     cJSON* item = cJSON_GetObjectItem(groupObj, name);
-    return item && cJSON_IsNumber(item) ? item->valuedouble : 0.0;
+    double result = item && cJSON_IsNumber(item) ? item->valuedouble : 0.0;
+    g_rec_mutex_unlock(&status_lock);
+    return result;
 }
 
 char* ACAP_STATUS_String(const char* group, const char* name) {
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
+        g_rec_mutex_unlock(&status_lock);
         return NULL;
     }
 
     cJSON* item = cJSON_GetObjectItem(groupObj, name);
-    return item && cJSON_IsString(item) ? item->valuestring : NULL;
+    char* result = item && cJSON_IsString(item) ? g_strdup(item->valuestring) : NULL;
+    g_rec_mutex_unlock(&status_lock);
+    return result;
 }
 
 cJSON* ACAP_STATUS_Object(const char* group, const char* name) {
+    g_rec_mutex_lock(&status_lock);
     cJSON* groupObj = ACAP_STATUS_Group(group);
     if (!groupObj) {
+        g_rec_mutex_unlock(&status_lock);
         return NULL;
     }
 
-    return cJSON_GetObjectItem(groupObj, name);
+    cJSON* item = cJSON_GetObjectItem(groupObj, name);
+    cJSON* result = item ? cJSON_Duplicate(item, 1) : NULL;
+    g_rec_mutex_unlock(&status_lock);
+    return result;
 }
 
 /*------------------------------------------------------------------
@@ -1463,78 +1527,112 @@ cJSON* ACAP_DEVICE(void) {
 
 double
 ACAP_DEVICE_Longitude() {
+    g_rec_mutex_lock(&status_lock);
 	if( !ACAP_DEVICE_Container )
-		return 0;
+        goto missing;
 	cJSON* location = cJSON_GetObjectItem(ACAP_DEVICE_Container,"location");
 	if(!location)
-		return 0;
-	return cJSON_GetObjectItem(location,"lon")?cJSON_GetObjectItem(location,"lon")->valuedouble:0;
+        goto missing;
+    double value = cJSON_GetObjectItem(location,"lon") ? cJSON_GetObjectItem(location,"lon")->valuedouble : 0;
+    g_rec_mutex_unlock(&status_lock);
+    return value;
+missing:
+    g_rec_mutex_unlock(&status_lock);
+    return 0;
 }
 
 double
 ACAP_DEVICE_Latitude() {
+    g_rec_mutex_lock(&status_lock);
 	if( !ACAP_DEVICE_Container )
-		return 0;
+        goto missing;
 	cJSON* location = cJSON_GetObjectItem(ACAP_DEVICE_Container,"location");
 	if(!location)
-		return 0;
-	return cJSON_GetObjectItem(location,"lat")?cJSON_GetObjectItem(location,"lat")->valuedouble:0;
+        goto missing;
+    double value = cJSON_GetObjectItem(location,"lat") ? cJSON_GetObjectItem(location,"lat")->valuedouble : 0;
+    g_rec_mutex_unlock(&status_lock);
+    return value;
+missing:
+    g_rec_mutex_unlock(&status_lock);
+    return 0;
 }
 
 int
 ACAP_DEVICE_Set_Location( double lat, double lon) {
 	LOG_TRACE("%s: %f %f\n",__func__,lat,lon);
+    g_rec_mutex_lock(&status_lock);
 	if( !ACAP_DEVICE_Container )
-		return 0;
+        goto failed;
 	cJSON* location = cJSON_GetObjectItem(ACAP_DEVICE_Container,"location");
 	if(!location ) {
 		LOG_WARN("%s: Missing location data\n",__func__);
-		return 0;
+        goto failed;
 	}
 	cJSON_ReplaceItemInObject(location,"lat",cJSON_CreateNumber(lat));
 	cJSON_ReplaceItemInObject(location,"lon",cJSON_CreateNumber(lon));
-	return SetLocationData(location);
+    int result = SetLocationData(location);
+    g_rec_mutex_unlock(&status_lock);
+    return result;
+failed:
+    g_rec_mutex_unlock(&status_lock);
+    return 0;
 }
 
 int
 ACAP_DEVICE_Seconds_Since_Midnight() {
 	time_t t = time(NULL);
-	struct tm tm = *localtime(&t);
+    struct tm tm;
+    if (!localtime_r(&t, &tm)) {
+        return 0;
+    }
 	int seconds = tm.tm_hour * 3600;
 	seconds += tm.tm_min * 60;
 	seconds += tm.tm_sec;
 	return seconds;
 }
 
-char ACAP_DEVICE_timestring[128] = "2020-01-01 00:00:00";
-char ACAP_DEVICE_date[128] = "2023-01-01";
-char ACAP_DEVICE_time[128] = "00:00:00";
-char ACAP_DEVICE_isostring[128] = "2020-01-01T00:00:00+0000";
+static GPrivate device_time_buffer_key = G_PRIVATE_INIT(g_free);
+
+static char* device_time_buffer(void) {
+    char* buffer = g_private_get(&device_time_buffer_key);
+    if (!buffer) {
+        buffer = g_malloc0(128);
+        g_private_set(&device_time_buffer_key, buffer);
+    }
+    return buffer;
+}
 
 const char*
 ACAP_DEVICE_Date() {
 	time_t t = time(NULL);
-	struct tm *tm = localtime(&t);
-	sprintf(ACAP_DEVICE_date,"%d-%02d-%02d",tm->tm_year + 1900,tm->tm_mon + 1, tm->tm_mday);
-	return ACAP_DEVICE_date;
+    struct tm tm;
+    char* buffer = device_time_buffer();
+    if (!localtime_r(&t, &tm)) return "";
+    snprintf(buffer, 128, "%d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    return buffer;
 }
 
 const char*
 ACAP_DEVICE_Time() {
 	time_t t = time(NULL);
-	struct tm *tm = localtime(&t);
-	sprintf(ACAP_DEVICE_time,"%02d:%02d:%02d",tm->tm_hour,tm->tm_min,tm->tm_sec);
-	return ACAP_DEVICE_time;
+    struct tm tm;
+    char* buffer = device_time_buffer();
+    if (!localtime_r(&t, &tm)) return "";
+    snprintf(buffer, 128, "%02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+    return buffer;
 }
 
 
 const char*
 ACAP_DEVICE_Local_Time() {
 	time_t t = time(NULL);
-	struct tm *tm = localtime(&t);
-	sprintf(ACAP_DEVICE_timestring,"%d-%02d-%02d %02d:%02d:%02d",tm->tm_year + 1900,tm->tm_mon + 1, tm->tm_mday,tm->tm_hour,tm->tm_min,tm->tm_sec);
-	LOG_TRACE("Local Time: %s\n",ACAP_DEVICE_timestring);
-	return ACAP_DEVICE_timestring;
+    struct tm tm;
+    char* buffer = device_time_buffer();
+    if (!localtime_r(&t, &tm)) return "";
+    snprintf(buffer, 128, "%d-%02d-%02d %02d:%02d:%02d", tm.tm_year + 1900,
+             tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    LOG_TRACE("Local Time: %s\n", buffer);
+    return buffer;
 }
 
 
@@ -1542,9 +1640,11 @@ ACAP_DEVICE_Local_Time() {
 const char*
 ACAP_DEVICE_ISOTime() {
 	time_t t = time(NULL);
-	struct tm *tm = localtime(&t);
-	strftime(ACAP_DEVICE_isostring, 50, "%Y-%m-%dT%T%z",tm);
-	return ACAP_DEVICE_isostring;
+    struct tm tm;
+    char* buffer = device_time_buffer();
+    if (!localtime_r(&t, &tm)) return "";
+    strftime(buffer, 128, "%Y-%m-%dT%T%z", &tm);
+    return buffer;
 }
 
 double
@@ -2585,7 +2685,7 @@ void ACAP_Background_Job_End(void) {
     g_atomic_int_add(&acap_background_jobs, -1);
 }
 
-void ACAP_Background_Jobs_Wait(int timeout_ms) {
+int ACAP_Background_Jobs_Wait(int timeout_ms) {
     long long waited_ms = 0;
     const int step_ms = 100;
     while (g_atomic_int_get(&acap_background_jobs) > 0 && waited_ms < timeout_ms) {
@@ -2596,6 +2696,15 @@ void ACAP_Background_Jobs_Wait(int timeout_ms) {
         LOG_WARN("%s: %d background job(s) still running after %dms, proceeding with cleanup anyway\n",
                   __func__, g_atomic_int_get(&acap_background_jobs), timeout_ms);
     }
+    return g_atomic_int_get(&acap_background_jobs);
+}
+
+void ACAP_Request_Shutdown(void) {
+    g_atomic_int_set(&acap_shutting_down, 1);
+}
+
+int ACAP_Shutdown_Requested(void) {
+    return g_atomic_int_get(&acap_shutting_down);
 }
 
 /*------------------------------------------------------------------
@@ -2603,6 +2712,7 @@ void ACAP_Background_Jobs_Wait(int timeout_ms) {
  *------------------------------------------------------------------*/
 
 void ACAP_Cleanup(void) {
+    ACAP_Request_Shutdown();
     // Stop accepting new HTTP requests first, so nothing can queue a new background job (e.g.
     // via a PUT that spawns a GThread) during the wait below - only then can "wait for jobs
     // still running" actually reach zero and stay there.
@@ -2612,7 +2722,12 @@ void ACAP_Cleanup(void) {
     // thread) finish before freeing the shared state below (e.g. status_container) it writes to
     // - otherwise a job still running at shutdown can write to memory this function is about to
     // free, corrupting the heap. Bounded so a stuck job can't hang shutdown forever.
-    ACAP_Background_Jobs_Wait(30000);
+    int remaining_jobs = ACAP_Background_Jobs_Wait(30000);
+    if (remaining_jobs > 0) {
+        LOG_WARN("%s: preserving shared state for %d worker(s) still shutting down\n",
+                 __func__, remaining_jobs);
+        return;
+    }
 
     // No status_lock here on purpose: the FastCGI thread is already joined and
     // the background jobs have drained, so nothing else can touch this, and

@@ -8,6 +8,13 @@
 
 int media_ffmpeg_available(void);
 const char* media_last_error(void);
+int media_job_try_admit(void);
+void media_job_release(void);
+int media_job_is_active(void);
+void media_exclusive_lock(void);
+void media_exclusive_unlock(void);
+void media_storage_transaction_lock(void);
+void media_storage_transaction_unlock(void);
 int media_generate_preview(const char* profile_id, int fps, char* out_path, size_t out_len, int allow_rebuild);
 int media_generate_export(const char* profile_id, int fps, char* out_path, size_t out_len);
 int media_generate_archive(const char* profile_id, int fps, const char* output_path);

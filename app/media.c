@@ -21,11 +21,13 @@
 #define LOG(fmt, args...) { syslog(LOG_INFO, fmt, ## args); printf(fmt, ## args); }
 #define LOG_WARN(fmt, args...) { syslog(LOG_WARNING, fmt, ## args); printf(fmt, ## args); }
 
-static char last_error[512];
 static GMutex encode_mutex;
+static GMutex throughput_mutex;
+static GRecMutex storage_transaction_mutex;
+static GPrivate last_error_key = G_PRIVATE_INIT(g_free);
 static char ffmpeg_path[512];
-static int ffmpeg_path_resolved = 0;
-static int ffmpeg_path_logged = 0;
+static gsize ffmpeg_path_once = 0;
+static gint foreground_job_active = 0;
 
 #define REENCODE_EST_MBPS 2.5
 // Batches are only flushed into the permanent export cache once genuinely quiet (no new
@@ -67,33 +69,57 @@ typedef struct {
 } RecordingSnapshot;
 
 static void set_last_error(const char* fmt, const char* detail) {
-    snprintf(last_error, sizeof(last_error), fmt, detail ? detail : "");
+    g_private_replace(&last_error_key, g_strdup_printf(fmt, detail ? detail : ""));
+}
+
+static void clear_last_error(void) {
+    g_private_replace(&last_error_key, NULL);
 }
 
 static const char* resolve_ffmpeg_path(void) {
-    if (ffmpeg_path_resolved) {
-        return ffmpeg_path;
-    }
-
-    ffmpeg_path[0] = '\0';
-
-    const char* env_path = getenv("TIMELAPSE_FFMPEG_PATH");
-    if (env_path && env_path[0] && access(env_path, X_OK) == 0) {
-        snprintf(ffmpeg_path, sizeof(ffmpeg_path), "%s", env_path);
-    } else if (access(PACKAGED_FFMPEG_BIN, X_OK) == 0) {
-        snprintf(ffmpeg_path, sizeof(ffmpeg_path), "%s", PACKAGED_FFMPEG_BIN);
-    } else if (access(PACKAGED_FFMPEG_LIB, X_OK) == 0) {
-        snprintf(ffmpeg_path, sizeof(ffmpeg_path), "%s", PACKAGED_FFMPEG_LIB);
-    } else {
+    if (g_once_init_enter(&ffmpeg_path_once)) {
         ffmpeg_path[0] = '\0';
-    }
 
-    ffmpeg_path_resolved = 1;
-    if (!ffmpeg_path_logged) {
+        const char* env_path = getenv("TIMELAPSE_FFMPEG_PATH");
+        if (env_path && env_path[0] && access(env_path, X_OK) == 0) {
+            snprintf(ffmpeg_path, sizeof(ffmpeg_path), "%s", env_path);
+        } else if (access(PACKAGED_FFMPEG_BIN, X_OK) == 0) {
+            snprintf(ffmpeg_path, sizeof(ffmpeg_path), "%s", PACKAGED_FFMPEG_BIN);
+        } else if (access(PACKAGED_FFMPEG_LIB, X_OK) == 0) {
+            snprintf(ffmpeg_path, sizeof(ffmpeg_path), "%s", PACKAGED_FFMPEG_LIB);
+        }
         LOG("%s: using ffmpeg path=%s\n", __func__, ffmpeg_path);
-        ffmpeg_path_logged = 1;
+        g_once_init_leave(&ffmpeg_path_once, 1);
     }
     return ffmpeg_path;
+}
+
+int media_job_try_admit(void) {
+    return g_atomic_int_compare_and_exchange(&foreground_job_active, 0, 1);
+}
+
+void media_job_release(void) {
+    g_atomic_int_set(&foreground_job_active, 0);
+}
+
+int media_job_is_active(void) {
+    return g_atomic_int_get(&foreground_job_active);
+}
+
+void media_exclusive_lock(void) {
+    g_mutex_lock(&encode_mutex);
+}
+
+void media_exclusive_unlock(void) {
+    g_mutex_unlock(&encode_mutex);
+}
+
+void media_storage_transaction_lock(void) {
+    g_rec_mutex_lock(&storage_transaction_mutex);
+}
+
+void media_storage_transaction_unlock(void) {
+    g_rec_mutex_unlock(&storage_transaction_mutex);
 }
 
 static int clamp_fps(int fps) {
@@ -117,14 +143,19 @@ static void record_encode_throughput(int frame_count, long long elapsed_ms) {
     double sample_ms_per_frame = (double)elapsed_ms / (double)frame_count;
     // Exponential moving average: recent runs matter more than history, but one unusually
     // fast/slow job shouldn't swing the next estimate wildly either.
+    g_mutex_lock(&throughput_mutex);
     avg_encode_ms_per_frame = (avg_encode_ms_per_frame * 0.7) + (sample_ms_per_frame * 0.3);
+    g_mutex_unlock(&throughput_mutex);
 }
 
 static double estimate_encode_seconds(int frame_count) {
     if (frame_count < 1) {
         return 2.0;
     }
-    double estimate = (avg_encode_ms_per_frame * (double)frame_count) / 1000.0;
+    g_mutex_lock(&throughput_mutex);
+    double average_ms = avg_encode_ms_per_frame;
+    g_mutex_unlock(&throughput_mutex);
+    double estimate = (average_ms * (double)frame_count) / 1000.0;
     return estimate < 1.0 ? 1.0 : estimate;
 }
 
@@ -443,6 +474,7 @@ typedef struct {
     gint wait_status;    // raw wait status, as g_spawn_sync would have reported it
     gchar* stderr_text;  // owned by the caller, free with g_free
     int guard_killed;    // the guard stopped it, the kernel did not
+    int cancelled;       // application shutdown stopped it
     int peak_rss_mb;     // VmHWM of the child, 0 when it could not be read
 } FfmpegRun;
 
@@ -581,6 +613,11 @@ static gboolean run_ffmpeg_guarded(char** argv, int budget_mb, const char* what,
             continue;
         }
 
+        if (ACAP_Shutdown_Requested() && !run->cancelled) {
+            run->cancelled = 1;
+            kill((pid_t)child_pid, SIGKILL);
+        }
+
         if (memory_guard_should_stop((pid_t)child_pid, budget_mb, what,
                                      &low_memory_samples, &peak_rss_kb) && !run->guard_killed) {
             run->guard_killed = 1;
@@ -611,6 +648,10 @@ static gboolean run_ffmpeg_guarded(char** argv, int budget_mb, const char* what,
    because it never happened: the guard got there first. */
 static const char* describe_ffmpeg_failure(const FfmpegRun* run, int budget_mb,
                                            char* buf, size_t buf_len) {
+    if (run->cancelled) {
+        snprintf(buf, buf_len, "cancelled during application shutdown");
+        return buf;
+    }
     if (run->guard_killed) {
         snprintf(buf, buf_len, "stopped to protect device memory (peak %d MB, budget %d MB)",
                  run->peak_rss_mb, budget_mb);
@@ -946,7 +987,7 @@ static int cache_is_valid(const char* profile_id, MediaKind kind, const char* ou
 
     cJSON_Delete(root);
     if (valid) {
-        last_error[0] = '\0';
+        clear_last_error();
     }
     return valid;
 }
@@ -1060,7 +1101,7 @@ static void prune_cache_variants(const char* profile_id, MediaKind kind, const c
 int media_ffmpeg_available(void) {
     const char* path = resolve_ffmpeg_path();
     if (path && path[0] && access(path, X_OK) == 0) {
-        last_error[0] = '\0';
+        clear_last_error();
         return 1;
     }
 
@@ -1073,7 +1114,8 @@ int media_ffmpeg_available(void) {
 }
 
 const char* media_last_error(void) {
-    return last_error[0] ? last_error : "Unknown media error";
+    const char* error = g_private_get(&last_error_key);
+    return error && error[0] ? error : "Unknown media error";
 }
 
 static int ensure_cache_dir(const char* profile_id) {
@@ -1187,28 +1229,30 @@ static int remux_copy_video(const char* input_path, const char* output_path) {
     return 1;
 }
 
-static int generate_mp4(const char* profile_id, int fps, const char* output_path, MediaKind kind, int force) {
+static int generate_mp4(const char* profile_id, int fps, const char* output_path, MediaKind kind, int force, int report_status) {
     long long started_ms = monotonic_ms();
     RecordingSnapshot snapshot;
-    if (!media_ffmpeg_available() || !get_recording_snapshot(profile_id, fps, &snapshot) || !ensure_cache_dir(profile_id)) {
+    if (!media_ffmpeg_available()) {
         LOG_WARN("%s: precheck failed kind=%s profile=%s err=%s\n", __func__, media_kind_name(kind), profile_id ? profile_id : "(null)", media_last_error());
+        return 0;
+    }
+
+    if (report_status) {
+        g_mutex_lock(&encode_mutex);
+    } else if (!g_mutex_trylock(&encode_mutex)) {
+        set_last_error("Media generation is already running for %s", profile_id);
+        LOG_WARN("%s: encode lock busy kind=%s profile=%s\n", __func__, media_kind_name(kind), profile_id);
+        return 0;
+    }
+
+    if (!get_recording_snapshot(profile_id, fps, &snapshot) || !ensure_cache_dir(profile_id)) {
+        LOG_WARN("%s: precheck failed kind=%s profile=%s err=%s\n", __func__, media_kind_name(kind), profile_id ? profile_id : "(null)", media_last_error());
+        g_mutex_unlock(&encode_mutex);
         return 0;
     }
 
     LOG("%s: start kind=%s profile=%s fps=%d frames=%d size_bytes=%lld\n",
         __func__, media_kind_name(kind), profile_id, snapshot.fps, snapshot.frames, snapshot.size_bytes);
-
-    if (cache_is_valid(profile_id, kind, output_path, &snapshot)) {
-        LOG("%s: cache hit kind=%s profile=%s path=%s elapsed_ms=%lld\n",
-            __func__, media_kind_name(kind), profile_id, output_path, monotonic_ms() - started_ms);
-        return 1;
-    }
-
-    if (!g_mutex_trylock(&encode_mutex)) {
-        set_last_error("Media generation is already running for %s", profile_id);
-        LOG_WARN("%s: encode lock busy kind=%s profile=%s\n", __func__, media_kind_name(kind), profile_id);
-        return 0;
-    }
 
     if (cache_is_valid(profile_id, kind, output_path, &snapshot)) {
         LOG("%s: cache hit after lock kind=%s profile=%s path=%s elapsed_ms=%lld\n",
@@ -1276,7 +1320,7 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
                 return 0;
             }
             prune_cache_variants(profile_id, kind, output_path);
-            last_error[0] = '\0';
+            clear_last_error();
             LOG("%s: incremental cache hit kind=%s profile=%s finalized=%d elapsed_ms=%lld\n",
                 __func__, media_kind_name(kind), profile_id, finalized_frames, monotonic_ms() - started_ms);
             g_mutex_unlock(&encode_mutex);
@@ -1287,7 +1331,7 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
         frame_count = snapshot.frames - finalized_frames;
     }
 
-    int media_job = 1;
+    int media_job = report_status;
 
     // Frame files can start at a higher index after incremental cleanup.
     char first_frame_path[1024];
@@ -1355,7 +1399,7 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
                     set_media_encode_status_done(copied, copied ? "Archive ready" : media_last_error());
                 }
                 if (copied) {
-                    last_error[0] = '\0';
+                    clear_last_error();
                 }
                 g_mutex_unlock(&encode_mutex);
                 return copied;
@@ -1381,7 +1425,7 @@ static int generate_mp4(const char* profile_id, int fps, const char* output_path
 
     if (kind != MEDIA_ARCHIVE && !force && finalized_frames > 0 && file_exists_nonempty(output_path) &&
         !should_process_incremental_update(snapshot.last, frame_count)) {
-        last_error[0] = '\0';
+        clear_last_error();
         LOG("%s: deferred incremental update kind=%s profile=%s pending=%d last_ms=%lld elapsed_ms=%lld\n",
             __func__, media_kind_name(kind), profile_id, frame_count, snapshot.last, monotonic_ms() - started_ms);
         g_mutex_unlock(&encode_mutex);
@@ -1745,7 +1789,7 @@ retry_encode:
     }
     prune_cache_variants(profile_id, kind, output_path);
 
-    last_error[0] = '\0';
+    clear_last_error();
     struct stat st;
     long long output_size = (stat(output_path, &st) == 0) ? (long long)st.st_size : -1;
     long long total_elapsed_ms = monotonic_ms() - started_ms;
@@ -1873,9 +1917,66 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
         return 0;
     }
 
-    if (!g_mutex_trylock(&encode_mutex)) {
-        set_last_error("Media generation is already running for %s", profile_id);
+    g_mutex_lock(&encode_mutex);
+
+    // Export processing may have run while this preview waited for the encoder, replacing
+    // the base video and deleting raw frames. Re-read every input that determines the merge
+    // range under the lock so the preview cannot be built from a stale pre-lock snapshot.
+    if (!get_recording_snapshot(profile_id, fps, &snapshot)) {
+        g_mutex_unlock(&encode_mutex);
         return 0;
+    }
+    have_export = file_exists_nonempty(export_path);
+    encoded_frames = 0;
+    if (have_export) {
+        char metadata_path[1200];
+        if (build_metadata_path(metadata_path, sizeof(metadata_path), export_path)) {
+            cJSON* root = read_json_file(metadata_path);
+            if (root) {
+                cJSON* frames_item = cJSON_GetObjectItem(root, "frames");
+                encoded_frames = frames_item ? frames_item->valueint : 0;
+                cJSON_Delete(root);
+            }
+        }
+    }
+    have_preview_file = have_preview_meta && file_exists_nonempty(preview_path);
+    preview_frames = 0;
+    if (have_preview_file) {
+        FILE* meta_file = fopen(preview_meta_path, "r");
+        if (meta_file) {
+            char preview_frames_text[32];
+            if (fgets(preview_frames_text, sizeof(preview_frames_text), meta_file)) {
+                preview_frames = atoi(preview_frames_text);
+            }
+            fclose(meta_file);
+        }
+    }
+    if (have_export && snapshot.frames <= encoded_frames) {
+        int copied = snprintf(out_path, out_len, "%s", export_path);
+        g_mutex_unlock(&encode_mutex);
+        if (copied <= 0 || (size_t)copied >= out_len) {
+            set_last_error("Failed to return preview path for %s", profile_id);
+            return 0;
+        }
+        return 1;
+    }
+    if (have_preview_file && snapshot.frames <= preview_frames) {
+        int copied = snprintf(out_path, out_len, "%s", preview_path);
+        g_mutex_unlock(&encode_mutex);
+        if (copied <= 0 || (size_t)copied >= out_len) {
+            set_last_error("Failed to return preview path for %s", profile_id);
+            return 0;
+        }
+        return 1;
+    }
+    base_path = NULL;
+    base_frames = 0;
+    if (have_export && encoded_frames >= preview_frames) {
+        base_path = export_path;
+        base_frames = encoded_frames;
+    } else if (have_preview_file) {
+        base_path = preview_path;
+        base_frames = preview_frames;
     }
 
     char frames_dir[1024];
@@ -2000,7 +2101,7 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
         set_last_error("Preview encode failed: %s",
                        !ok ? (error ? error->message : "spawn failed")
                            : describe_ffmpeg_failure(&run, budget_mb, failure_buf, sizeof(failure_buf)));
-        LOG_WARN("%s: tail encode failed profile=%s err=%s\n", __func__, profile_id, last_error);
+        LOG_WARN("%s: tail encode failed profile=%s err=%s\n", __func__, profile_id, media_last_error());
         if (error) {
             g_error_free(error);
         }
@@ -2120,8 +2221,6 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
         }
     }
 
-    g_mutex_unlock(&encode_mutex);
-
     // Record what this preview now covers so the next call (or a poll-driven "prepare" step
     // right before this one) can skip redoing the work if nothing new has been captured since.
     if (have_preview_meta) {
@@ -2136,8 +2235,10 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
 
     if (snprintf(out_path, out_len, "%s", preview_path) <= 0 || strlen(preview_path) >= out_len) {
         set_last_error("Failed to return preview path for %s", profile_id);
+        g_mutex_unlock(&encode_mutex);
         return 0;
     }
+    g_mutex_unlock(&encode_mutex);
     return 1;
 }
 
@@ -2147,7 +2248,7 @@ int media_generate_export(const char* profile_id, int fps, char* out_path, size_
         set_last_error("Failed to build export path for %s", profile_id);
         return 0;
     }
-    return generate_mp4(profile_id, fps, out_path, MEDIA_EXPORT, 0);
+    return generate_mp4(profile_id, fps, out_path, MEDIA_EXPORT, 0, 1);
 }
 
 int media_generate_archive(const char* profile_id, int fps, const char* output_path) {
@@ -2155,7 +2256,7 @@ int media_generate_archive(const char* profile_id, int fps, const char* output_p
         set_last_error("Invalid archive output path for %s", profile_id);
         return 0;
     }
-    return generate_mp4(profile_id, clamp_fps(fps), output_path, MEDIA_ARCHIVE, 0);
+    return generate_mp4(profile_id, clamp_fps(fps), output_path, MEDIA_ARCHIVE, 0, 1);
 }
 
 // Estimates the final export MP4 size from the currently-encoded video's own bytes-per-frame,
@@ -2315,7 +2416,6 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
     GError* spawn_error = NULL;
     gchar* stderr_text = NULL;
     gint stdout_fd = -1;
-    gint stderr_fd = -1;
     GPid child_pid = 0;
     /* Same guard as every other ffmpeg here, sampled off the progress lines this one
        already reads rather than a poll loop of its own. */
@@ -2326,7 +2426,7 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
     ChildLimits limits = { budget_mb > 0 ? (rlim_t)budget_mb * 2 * 1024 * 1024 : 0 };
     gboolean ok = g_spawn_async_with_pipes(NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD,
                                           apply_child_limits, &limits,
-                                          &child_pid, NULL, &stdout_fd, &stderr_fd, &spawn_error);
+                                          &child_pid, NULL, &stdout_fd, NULL, &spawn_error);
     if (!ok) {
         set_last_error("FFmpeg AVI migration failed: %s", spawn_error ? spawn_error->message : "unknown error");
         if (spawn_error) {
@@ -2337,24 +2437,41 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
         return 0;
     }
 
-    GString* stderr_buffer = g_string_new(NULL);
     FILE* stdout_stream = fdopen(stdout_fd, "r");
-    FILE* stderr_stream = fdopen(stderr_fd, "r");
     char line[512];
     gboolean cancelled = FALSE;
-    while (stdout_stream && fgets(line, sizeof(line), stdout_stream)) {
+    while (stdout_stream) {
+        struct pollfd progress_poll = { stdout_fd, POLLIN, 0 };
+        int poll_result = poll(&progress_poll, 1, MEM_GUARD_POLL_MS);
+        if (ACAP_Shutdown_Requested()) {
+            cancelled = TRUE;
+            kill(child_pid, SIGKILL);
+            break;
+        }
+        if (memory_guard_should_stop(child_pid, budget_mb, "AVI migration",
+                                     &low_memory_samples, &peak_rss_kb)) {
+            guard_killed = 1;
+            kill(child_pid, SIGKILL);
+            break;
+        }
+        if (poll_result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (poll_result <= 0) {
+            if (poll_result < 0) {
+                break;
+            }
+            continue;
+        }
+        if (!fgets(line, sizeof(line), stdout_stream)) {
+            break;
+        }
         char* newline = strchr(line, '\n');
         if (newline) {
             *newline = '\0';
         }
 
         if (g_str_has_prefix(line, "out_time_ms=")) {
-            if (memory_guard_should_stop(child_pid, budget_mb, "AVI migration",
-                                         &low_memory_samples, &peak_rss_kb)) {
-                guard_killed = 1;
-                kill(child_pid, SIGKILL);
-                break;
-            }
             gint64 out_time_us = g_ascii_strtoll(line + strlen("out_time_ms="), NULL, 10);
             double percent = duration_us > 0 ? ((double)out_time_us * 100.0) / (double)duration_us : 0.0;
             if (percent < 1.0) percent = 1.0;
@@ -2385,17 +2502,9 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
         fclose(stdout_stream);
     }
 
-    if (stderr_stream) {
-        while (fgets(line, sizeof(line), stderr_stream)) {
-            g_string_append(stderr_buffer, line);
-        }
-        fclose(stderr_stream);
-    }
-
     int wait_status = 0;
     waitpid(child_pid, &wait_status, 0);
     g_spawn_close_pid(child_pid);
-    stderr_text = g_string_free(stderr_buffer, FALSE);
 
     if (guard_killed) {
         char guard_detail[128];
@@ -2497,7 +2606,7 @@ int media_process_pending(const char* profile_id, int fps) {
         set_last_error("Failed to build export path for %s", profile_id);
         return 0;
     }
-    return generate_mp4(profile_id, fps, output_path, MEDIA_EXPORT, 0);
+    return generate_mp4(profile_id, fps, output_path, MEDIA_EXPORT, 0, 0);
 }
 
 // Bypasses the incremental-batch deferral so every currently captured frame is
@@ -2509,7 +2618,7 @@ int media_process_pending_force(const char* profile_id, int fps) {
         set_last_error("Failed to build export path for %s", profile_id);
         return 0;
     }
-    return generate_mp4(profile_id, fps, output_path, MEDIA_EXPORT, 1);
+    return generate_mp4(profile_id, fps, output_path, MEDIA_EXPORT, 1, 1);
 }
 
 int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
@@ -2542,12 +2651,19 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
         return 1;
     }
 
+    g_mutex_lock(&encode_mutex);
+    if (!file_exists_nonempty(old_path)) {
+        g_mutex_unlock(&encode_mutex);
+        return 1;
+    }
+
     set_reencode_status_active(profile_id, old_fps, new_fps, old_size_bytes);
 
     char new_temp[1200];
     int written = snprintf(new_temp, sizeof(new_temp), "%s.reencode.tmp", new_path);
     if (written <= 0 || (size_t)written >= sizeof(new_temp)) {
         set_last_error("Re-encode temp path too long for %s", profile_id);
+        g_mutex_unlock(&encode_mutex);
         return 0;
     }
 
@@ -2610,6 +2726,7 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
         }
         free_ffmpeg_run(&run);
         unlink(new_temp);
+        g_mutex_unlock(&encode_mutex);
         return 0;
     }
 
@@ -2622,6 +2739,7 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
         set_reencode_status_done(0, "Failed finalizing output");
         set_last_error("Failed to finalize re-encode: %s", strerror(errno));
         unlink(new_temp);
+        g_mutex_unlock(&encode_mutex);
         return 0;
     }
 
@@ -2643,5 +2761,6 @@ int media_reencode_export(const char* profile_id, int old_fps, int new_fps) {
     }
     unlink(old_path);
     set_reencode_status_done(1, "Re-encode completed");
+    g_mutex_unlock(&encode_mutex);
     return 1;
 }

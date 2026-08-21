@@ -613,7 +613,7 @@ static cJSON* recording_entry_from_task(MigrationTask* task) {
 }
 
 static gboolean run_complete_callback(gpointer user_data) {
-    services_callback_queued = 0;
+    g_atomic_int_set(&services_callback_queued, 0);
     if (complete_callback) {
         complete_callback();
     }
@@ -621,8 +621,7 @@ static gboolean run_complete_callback(gpointer user_data) {
 }
 
 static void queue_complete_callback(void) {
-    if (!services_callback_queued) {
-        services_callback_queued = 1;
+    if (g_atomic_int_compare_and_exchange(&services_callback_queued, 0, 1)) {
         g_idle_add(run_complete_callback, NULL);
     }
 }
@@ -807,7 +806,10 @@ static gpointer migration_thread(gpointer user_data) {
 // trampoline guarantees ACAP_Background_Job_End() fires exactly once whenever it returns,
 // by any path. See ACAP.h for why every detached background thread needs this.
 static gpointer migration_thread_tracked(gpointer user_data) {
+    media_storage_transaction_lock();
     gpointer result = migration_thread(user_data);
+    media_storage_transaction_unlock();
+    media_job_release();
     ACAP_Background_Job_End();
     return result;
 }
@@ -859,10 +861,17 @@ static void http_migration(const ACAP_HTTP_Response response, const ACAP_HTTP_Re
     }
 
     if (strcmp(action, "start") == 0) {
+        if (!media_job_try_admit()) {
+            cJSON_Delete(body);
+            ACAP_HTTP_Respond_Error(response, 409, "Another media operation is already running");
+            return;
+        }
+
         g_mutex_lock(&migration_mutex);
         const char* status = cJSON_GetStringValue(cJSON_GetObjectItem(migration_state, "status"));
         if (status && strcmp(status, "running") == 0) {
             g_mutex_unlock(&migration_mutex);
+            media_job_release();
             cJSON_Delete(body);
             ACAP_HTTP_Respond_Text(response, "Migration already running");
             return;
@@ -882,6 +891,7 @@ static void http_migration(const ACAP_HTTP_Response response, const ACAP_HTTP_Re
         GThread* thread = g_thread_new("avi-migration", migration_thread_tracked, NULL);
         if (!thread) {
             ACAP_Background_Job_End();
+            media_job_release();
             g_mutex_lock(&migration_mutex);
             set_state_string("status", "failed");
             set_state_string("message", "Unable to start migration worker.");

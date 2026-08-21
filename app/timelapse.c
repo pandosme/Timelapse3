@@ -83,13 +83,30 @@ typedef struct {
     GMutex   lock;
     GCond    cond;
     gboolean done;
+    gboolean started;
+    gboolean abandoned;
     int      result;
     int    (*fn)(void* arg);
     void*    arg;
 } MainThreadTask;
 
+static void Main_Thread_Task_Free(MainThreadTask* task) {
+    g_mutex_clear(&task->lock);
+    g_cond_clear(&task->cond);
+    g_free(task);
+}
+
 static gboolean Run_Main_Thread_Task(gpointer user_data) {
     MainThreadTask* task = (MainThreadTask*)user_data;
+    g_mutex_lock(&task->lock);
+    if (task->abandoned) {
+        g_mutex_unlock(&task->lock);
+        Main_Thread_Task_Free(task);
+        return G_SOURCE_REMOVE;
+    }
+    task->started = TRUE;
+    g_mutex_unlock(&task->lock);
+
     int result = task->fn(task->arg);
 
     g_mutex_lock(&task->lock);
@@ -107,25 +124,34 @@ static int Run_On_Main_Thread(int (*fn)(void*), void* arg) {
     if (!main_thread || g_thread_self() == main_thread) {
         return fn(arg);
     }
-
-    MainThreadTask task;
-    memset(&task, 0, sizeof(task));
-    g_mutex_init(&task.lock);
-    g_cond_init(&task.cond);
-    task.fn = fn;
-    task.arg = arg;
-
-    g_main_context_invoke(NULL, Run_Main_Thread_Task, &task);
-
-    g_mutex_lock(&task.lock);
-    while (!task.done) {
-        g_cond_wait(&task.cond, &task.lock);
+    if (ACAP_Shutdown_Requested()) {
+        return 0;
     }
-    int result = task.result;
-    g_mutex_unlock(&task.lock);
 
-    g_mutex_clear(&task.lock);
-    g_cond_clear(&task.cond);
+    MainThreadTask* task = g_new0(MainThreadTask, 1);
+    if (!task) {
+        return 0;
+    }
+    g_mutex_init(&task->lock);
+    g_cond_init(&task->cond);
+    task->fn = fn;
+    task->arg = arg;
+
+    g_main_context_invoke(NULL, Run_Main_Thread_Task, task);
+
+    g_mutex_lock(&task->lock);
+    while (!task->done) {
+        if (!g_cond_wait_until(&task->cond, &task->lock, g_get_monotonic_time() + G_TIME_SPAN_SECOND) &&
+            ACAP_Shutdown_Requested() && !task->started) {
+            task->abandoned = TRUE;
+            g_mutex_unlock(&task->lock);
+            return 0;
+        }
+    }
+    int result = task->result;
+    g_mutex_unlock(&task->lock);
+
+    Main_Thread_Task_Free(task);
     return result;
 }
 
@@ -355,6 +381,15 @@ static gpointer Reencode_Export_Thread(gpointer user_data) {
         return NULL;
     }
 
+    while (!media_job_try_admit()) {
+        if (ACAP_Shutdown_Requested()) {
+            g_free(task);
+            ACAP_Background_Job_End();
+            return NULL;
+        }
+        g_usleep(100 * 1000);
+    }
+
     LOG("%s: start profile=%s old_fps=%d new_fps=%d\n", __func__, task->profile_id, task->old_fps, task->new_fps);
     if (!media_reencode_export(task->profile_id, task->old_fps, task->new_fps)) {
         LOG_WARN("%s: failed profile=%s (%d->%d): %s\n", __func__, task->profile_id, task->old_fps, task->new_fps, media_last_error());
@@ -363,6 +398,7 @@ static gpointer Reencode_Export_Thread(gpointer user_data) {
     }
 
     g_free(task);
+    media_job_release();
     ACAP_Background_Job_End();
     return NULL;
 }
@@ -771,6 +807,21 @@ static int Reset_Task(void* arg) {
     return 1;
 }
 
+static int Pause_Task(void* arg) {
+    (void)arg;
+    g_rec_mutex_lock(&profiles_lock);
+    Teardown_All_Locked();
+    TimelapseProfiles = cJSON_CreateArray();
+    g_rec_mutex_unlock(&profiles_lock);
+    return 1;
+}
+
+void Timelapse_Pause(void) {
+    if (timelapse_initialized) {
+        Run_On_Main_Thread(Pause_Task, NULL);
+    }
+}
+
 void Timelapse_Reset(void) {
     /* /reset is reachable before the services start (that endpoint exists so a
        corrupt SD card can be wiped). Nothing to reset in that state, and the
@@ -899,20 +950,31 @@ static void HTTP_Endpoint_Timelapse(const ACAP_HTTP_Response response, const ACA
             return;
         }
 
-        // Remove all live and archived media before deleting the profile/settings.
-        if (!Recordings_Delete_Profile_Media(id)) {
-            LOG_WARN("%s: DELETE media purge failed on %s\n", __func__, id);
-            ACAP_HTTP_Respond_Error(response, 500, "Failed to delete recording media");
-            return;
-        }
-
+        cJSON* removed_profile = Timelapse_Get_Profile(id);
         if (!Timelapse_Remove_Profile_By_Id(id)) {
             LOG_WARN("%s: DELETE failed on %s\n", __func__, id);
+            cJSON_Delete(removed_profile);
             ACAP_HTTP_Respond_Error(response, 500, "Failed to delete timelapse profile");
             return;
         }
 
         Timelapse_Save_Profiles();
+
+        // Deactivate timers/subscriptions before deleting media so no main-context capture
+        // can recreate the profile directory after the purge. Restore the profile if media
+        // cleanup fails, leaving the user with a retryable and internally consistent state.
+        if (!Recordings_Delete_Profile_Media(id)) {
+            LOG_WARN("%s: DELETE media purge failed on %s\n", __func__, id);
+            if (removed_profile) {
+                Timelapse_Activate_Profile(removed_profile);
+                removed_profile = NULL;
+                Timelapse_Save_Profiles();
+            }
+            ACAP_HTTP_Respond_Error(response, 500, "Failed to delete recording media");
+            return;
+        }
+
+        cJSON_Delete(removed_profile);
         ACAP_HTTP_Respond_Text(response, "Timelapse deleted successfully");
         LOG_TRACE("%s: DELETE Success\n", __func__);
         return;

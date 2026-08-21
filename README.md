@@ -264,27 +264,14 @@ The About page shows:
 
 ## History
 
+### 3.1.4
+- Improved thread safety for recording, archive, preview, export and reset operations.
+- Captures made while an archive is being created are no longer removed before they are archived.
+- Improved shutdown handling so background video jobs and FFmpeg processes stop cleanly.
+- Fixed race conditions in settings, sun-event timers, status updates and media metadata.
+
 ### 3.1.3
-Fixes four faults reported from the field, described by what you would have seen on the camera.
-
-**The camera restarted, or other apps on it stopped, while a video was being built.** On cameras
-short of memory the camera's own watchdog took the device down instead of the app simply failing;
-Timelapse now watches its memory use while building a video, stops early and rebuilds at a smaller
-size, and does so for every step that handles video rather than only the first encode.
-
-**A recording set to archive daily was never archived and kept growing, in one case to 14 days and
-10 GB.** Archiving gave up after ten seconds if the hourly housekeeping pass held the encoder, and
-the timing repeats every night on a given camera; housekeeping now stands aside for archiving, and
-an archive waits up to thirty minutes for the encoder.
-
-**The camera logged a crash from Timelapse on every stop, restart and upgrade.** Two parts of the
-app released the same block of memory at shutdown, which in rare cases also damaged data being
-written at that moment; stopping and upgrading is now clean.
-
-**Recordings and archived files with a space or a national character in the name could not be
-played, downloaded or deleted.** The name from the browser was compared without being decoded, so
-the action silently did nothing; names are decoded correctly now, and a file name pointing outside
-the archive folder is rejected.
+- Improved several stability and behaviour issues
 
 ### 3.1.2
 Video encoding on cameras with limited memory:

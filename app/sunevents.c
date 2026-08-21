@@ -17,9 +17,28 @@ static cJSON* SunEventsSettings = NULL;
 static GSource* midnight_timer = NULL;
 static GSource* sunnoon_timer = NULL;
 static time_t last_scheduled_noon = 0;
+static GRecMutex sun_events_lock;
+static GThread* sun_events_main_thread = NULL;
 
 static void Calculate_Sun_Events(double lat, double lon);
 static void Setup_Midnight_Timer();
+
+typedef struct {
+    GMutex lock;
+    GCond cond;
+    double lat;
+    double lon;
+    int result;
+    int done;
+    int started;
+    int abandoned;
+} SunEventsUpdate;
+
+static void SunEvents_Update_Free(SunEventsUpdate* update) {
+    g_mutex_clear(&update->lock);
+    g_cond_clear(&update->cond);
+    g_free(update);
+}
 
 static double to_rad(double deg) {
     return deg * M_PI / 180.0;
@@ -66,8 +85,12 @@ static void Setup_SunNoon_Timer(time_t noon) {
 // Setup timer for next midnight
 static gboolean Midnight_Timer_Callback(gpointer user_data) {
     LOG_TRACE("%s: Midnight timer triggered\n", __func__);
-    double lat = cJSON_GetObjectItem(SunEventsSettings, "lat")->valuedouble;
-    double lon = cJSON_GetObjectItem(SunEventsSettings, "lon")->valuedouble;
+    g_rec_mutex_lock(&sun_events_lock);
+    cJSON* lat_item = SunEventsSettings ? cJSON_GetObjectItem(SunEventsSettings, "lat") : NULL;
+    cJSON* lon_item = SunEventsSettings ? cJSON_GetObjectItem(SunEventsSettings, "lon") : NULL;
+    double lat = lat_item ? lat_item->valuedouble : 0.0;
+    double lon = lon_item ? lon_item->valuedouble : 0.0;
+    g_rec_mutex_unlock(&sun_events_lock);
     Calculate_Sun_Events(lat, lon);
 	Setup_Midnight_Timer();
     return G_SOURCE_REMOVE;  // Return NULL instead of continuing
@@ -78,7 +101,8 @@ static void Setup_Midnight_Timer() {
     
     time_t now;
     time(&now);
-    struct tm* local = localtime(&now);
+    struct tm local_time;
+    struct tm* local = localtime_r(&now, &local_time);
     int seconds_to_midnight = ((23 - local->tm_hour) * 3600) + 
                             ((59 - local->tm_min) * 60) + 
                             (60 - local->tm_sec);
@@ -102,23 +126,7 @@ static void Setup_Midnight_Timer() {
 }
 
 
-int SunEvents_Set(cJSON* location) {
-    if (!location || !SunEventsSettings) return -1;
-	
-    // Debug print current settings
-    char *debug_str = cJSON_PrintUnformatted(location);
-    if (debug_str) {
-        LOG_TRACE("%s: Updatating location: %s\n", __func__, debug_str);
-        free(debug_str);
-    }	
-    
-    cJSON* lon_obj = cJSON_GetObjectItem(location, "lon");
-    cJSON* lat_obj = cJSON_GetObjectItem(location, "lat");
-    if (!lon_obj || !lat_obj) return -1;
-    
-    double lon = lon_obj->valuedouble;
-    double lat = lat_obj->valuedouble;
-    
+static int Apply_SunEvents_Update(double lat, double lon) {
     if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
         LOG_WARN("%s: Invalid coordinates lat=%f, lon=%f\n", __func__, lat, lon);
         return 0;
@@ -126,50 +134,93 @@ int SunEvents_Set(cJSON* location) {
 
 	if( !ACAP_DEVICE_Set_Location( lat, lon) )
 		LOG_WARN("%s: Error storing GeoLocation\n",__func__);
-    
-    if (!SunEventsSettings) {
-		SunEventsSettings = cJSON_CreateObject();
-		cJSON_AddNumberToObject(SunEventsSettings, "lat", lat);
-		cJSON_AddNumberToObject(SunEventsSettings, "lon", lon);
-		cJSON_AddNumberToObject(SunEventsSettings, "dawn", 0);
-		cJSON_AddNumberToObject(SunEventsSettings, "sunrise", 0);
-		cJSON_AddNumberToObject(SunEventsSettings, "sunnoon", 0);
-		cJSON_AddNumberToObject(SunEventsSettings, "sunset", 0);
-		cJSON_AddNumberToObject(SunEventsSettings, "dusk", 0);
-	}
-	
     LOG_TRACE("%s: Setting location to lat=%f, lon=%f\n", __func__, lat, lon);
     Calculate_Sun_Events(lat, lon);
     return 1;
 }
 
-int SunEvents_Between_Dawn_Dusk() {
-    if (!SunEventsSettings) {
-        LOG_WARN("%s: SunEventsSettings is NULL\n", __func__);
-        return 0;
+static gboolean Run_SunEvents_Update(gpointer user_data) {
+    SunEventsUpdate* update = (SunEventsUpdate*)user_data;
+    g_mutex_lock(&update->lock);
+    if (update->abandoned) {
+        g_mutex_unlock(&update->lock);
+        SunEvents_Update_Free(update);
+        return G_SOURCE_REMOVE;
+    }
+    update->started = 1;
+    g_mutex_unlock(&update->lock);
+
+    int result = Apply_SunEvents_Update(update->lat, update->lon);
+    g_mutex_lock(&update->lock);
+    update->result = result;
+    update->done = 1;
+    g_cond_signal(&update->cond);
+    g_mutex_unlock(&update->lock);
+    return G_SOURCE_REMOVE;
+}
+
+int SunEvents_Set(cJSON* location) {
+    if (!location || !SunEventsSettings) return -1;
+
+    cJSON* lon_obj = cJSON_GetObjectItem(location, "lon");
+    cJSON* lat_obj = cJSON_GetObjectItem(location, "lat");
+    if (!lon_obj || !lat_obj) return -1;
+
+    double lon = lon_obj->valuedouble;
+    double lat = lat_obj->valuedouble;
+    if (g_thread_self() == sun_events_main_thread) {
+        return Apply_SunEvents_Update(lat, lon);
+    }
+    if (ACAP_Shutdown_Requested()) {
+        return -1;
     }
 
-    char* json = cJSON_PrintUnformatted(SunEventsSettings);
-    if (json) {
-        LOG_TRACE("%s: %s\n", __func__, json);
-        free(json);
-    } else {
-        LOG_TRACE("%s: Unable to print json\n", __func__);
+    SunEventsUpdate* update = g_new0(SunEventsUpdate, 1);
+    if (!update) {
+        return -1;
+    }
+    update->lat = lat;
+    update->lon = lon;
+    g_mutex_init(&update->lock);
+    g_cond_init(&update->cond);
+    g_main_context_invoke(NULL, Run_SunEvents_Update, update);
+    g_mutex_lock(&update->lock);
+    while (!update->done) {
+        if (!g_cond_wait_until(&update->cond, &update->lock, g_get_monotonic_time() + G_TIME_SPAN_SECOND) &&
+            ACAP_Shutdown_Requested() && !update->started) {
+            update->abandoned = 1;
+            g_mutex_unlock(&update->lock);
+            return -1;
+        }
+    }
+    int result = update->result;
+    g_mutex_unlock(&update->lock);
+    SunEvents_Update_Free(update);
+    return result;
+}
+
+int SunEvents_Between_Dawn_Dusk() {
+    g_rec_mutex_lock(&sun_events_lock);
+    if (!SunEventsSettings) {
+        LOG_WARN("%s: SunEventsSettings is NULL\n", __func__);
+        g_rec_mutex_unlock(&sun_events_lock);
+        return 0;
     }
 
     cJSON* dawn_obj = cJSON_GetObjectItem(SunEventsSettings, "dawn");
     cJSON* dusk_obj = cJSON_GetObjectItem(SunEventsSettings, "dusk");
     if (!dawn_obj || !dusk_obj) {
         LOG_WARN("%s: Missing dawn or dusk in SunEventsSettings\n", __func__);
+        g_rec_mutex_unlock(&sun_events_lock);
         return 0;
     }
 
-    time_t now;
-    time(&now);
-
-    // Get dawn and dusk timestamps
     time_t dawn = (time_t)dawn_obj->valuedouble;
     time_t dusk = (time_t)dusk_obj->valuedouble;
+    g_rec_mutex_unlock(&sun_events_lock);
+
+    time_t now;
+    time(&now);
 
     // Calculate seconds since midnight for now
     struct tm tm_now;
@@ -196,34 +247,27 @@ int SunEvents_Between_Dawn_Dusk() {
 }
 
 int SunEvents_Between_Sunrise_Sunset() {
+    g_rec_mutex_lock(&sun_events_lock);
     if (!SunEventsSettings) {
         LOG_WARN("%s: SunEventsSettings is NULL\n", __func__);
+        g_rec_mutex_unlock(&sun_events_lock);
         return 0;
     }
-
-    LOG_TRACE("%s: Debug 1\n", __func__);
-    char* json = cJSON_PrintUnformatted(SunEventsSettings);
-    if (json) {
-        LOG_TRACE("%s: %s\n", __func__, json);
-        free(json);
-    } else {
-        LOG_TRACE("%s: Unable to print json\n", __func__);
-    }
-    LOG_TRACE("%s: Debug 2\n", __func__);
 
     cJSON* sunrise_obj = cJSON_GetObjectItem(SunEventsSettings, "sunrise");
     cJSON* sunset_obj = cJSON_GetObjectItem(SunEventsSettings, "sunset");
     if (!sunrise_obj || !sunset_obj) {
         LOG_WARN("%s: Missing sunrise or sunset in SunEventsSettings\n", __func__);
+        g_rec_mutex_unlock(&sun_events_lock);
         return 0;
     }
 
-    time_t now;
-    time(&now);
-
-    // Get sunrise and sunset timestamps
     time_t sunrise = (time_t)sunrise_obj->valuedouble;
     time_t sunset = (time_t)sunset_obj->valuedouble;
+    g_rec_mutex_unlock(&sun_events_lock);
+
+    time_t now;
+    time(&now);
 
     // Calculate seconds since midnight for now
     struct tm tm_now;
@@ -271,9 +315,17 @@ static void HTTP_Endpoint_Sunevents(const ACAP_HTTP_Response response, const ACA
             return;
         }
         
-        SunEvents_Set(location);
+        int result = SunEvents_Set(location);
         cJSON_Delete(location);
-        ACAP_HTTP_Respond_JSON(response, SunEventsSettings);
+        if (result <= 0) {
+            ACAP_HTTP_Respond_Error(response, 400, "Invalid sun-event location");
+            return;
+        }
+        g_rec_mutex_lock(&sun_events_lock);
+        cJSON* snapshot = cJSON_Duplicate(SunEventsSettings, 1);
+        g_rec_mutex_unlock(&sun_events_lock);
+        ACAP_HTTP_Respond_JSON(response, snapshot);
+        cJSON_Delete(snapshot);
         return;
     }
     
@@ -284,14 +336,11 @@ static void HTTP_Endpoint_Sunevents(const ACAP_HTTP_Response response, const ACA
 			return;
 		}
 		
-		// Debug print current settings
-		char *debug_str = cJSON_PrintUnformatted(SunEventsSettings);
-		if (debug_str) {
-			LOG_TRACE("%s: Sending JSON response: %s\n", __func__, debug_str);
-			free(debug_str);
-		}
-		
-		ACAP_HTTP_Respond_JSON(response, SunEventsSettings);
+        g_rec_mutex_lock(&sun_events_lock);
+        cJSON* snapshot = cJSON_Duplicate(SunEventsSettings, 1);
+        g_rec_mutex_unlock(&sun_events_lock);
+        ACAP_HTTP_Respond_JSON(response, snapshot);
+        cJSON_Delete(snapshot);
 		return;
 	}
     
@@ -300,9 +349,7 @@ static void HTTP_Endpoint_Sunevents(const ACAP_HTTP_Response response, const ACA
 
 int SunEvents_Init() {
     LOG_TRACE("%s: Initializing sun events\n", __func__);
-    
-    SunEventsSettings = cJSON_CreateObject();
-    if (!SunEventsSettings) return -1;
+    sun_events_main_thread = g_thread_self();
     
     double lat = ACAP_DEVICE_Latitude();
 	double lon = ACAP_DEVICE_Longitude();
@@ -341,7 +388,8 @@ static void Calculate_Sun_Events(double lat, double lon) {
 	time_t now;
 	time(&now);
 
-	struct tm* local = localtime(&now);
+    struct tm local_time;
+    struct tm* local = localtime_r(&now, &local_time);
 	if (!local) {
 		LOG_WARN("%s: Failed to get local time\n", __func__);
 		return;
@@ -409,7 +457,8 @@ static void Calculate_Sun_Events(double lat, double lon) {
 	   return;
 	}
 
-	// Update JSON object with calculated values
+    // Update JSON object with calculated values
+    g_rec_mutex_lock(&sun_events_lock);
 	cJSON_ReplaceItemInObject(SunEventsSettings, "lat", cJSON_CreateNumber(lat));
 	cJSON_ReplaceItemInObject(SunEventsSettings, "lon", cJSON_CreateNumber(lon));
 	cJSON_ReplaceItemInObject(SunEventsSettings, "dawn", cJSON_CreateNumber((double)dawn));
@@ -423,6 +472,7 @@ static void Calculate_Sun_Events(double lat, double lon) {
 		LOG_TRACE("%s: %s\n",__func__,json);
 		free(json);
 	}
+    g_rec_mutex_unlock(&sun_events_lock);
 	
     // Setup timer for solar noon
     Setup_SunNoon_Timer(solar_noon);

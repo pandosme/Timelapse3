@@ -255,6 +255,34 @@ int recording_store_clear(const char* profile_id) {
     return saved;
 }
 
+int recording_store_clear_if_unchanged(const char* profile_id, int expected_frames, double expected_last) {
+    if (!profile_id) {
+        return -1;
+    }
+
+    g_rec_mutex_lock(&recording_mutex);
+    cJSON* recording = cJSON_GetObjectItem(recording_state_locked(), profile_id);
+    cJSON* frames = recording ? cJSON_GetObjectItem(recording, "frames") : NULL;
+    cJSON* last = recording ? cJSON_GetObjectItem(recording, "last") : NULL;
+    if (!frames || !last || frames->valueint != expected_frames || last->valuedouble != expected_last) {
+        g_rec_mutex_unlock(&recording_mutex);
+        return 0;
+    }
+
+    char profile_dir[1024];
+    if (storage_profile_dir(profile_dir, sizeof(profile_dir), profile_id) &&
+        !storage_remove_tree(profile_dir)) {
+        LOG_WARN("%s: Failed to purge profile directory %s\n", __func__, profile_dir);
+        g_rec_mutex_unlock(&recording_mutex);
+        return -1;
+    }
+
+    cJSON_DeleteItemFromObject(recording_state_locked(), profile_id);
+    int saved = save_state();
+    g_rec_mutex_unlock(&recording_mutex);
+    return saved ? 1 : -1;
+}
+
 int recording_store_reset(void) {
     g_rec_mutex_lock(&recording_mutex);
     if (recording_state) {
