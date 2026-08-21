@@ -10,7 +10,7 @@ Typical uses include:
 - Event trigger validation
 - Daily daylight snapshots, such as sun-noon progress images
 
-[Download Pre-Compiled ACAP (zip)](https://www.dropbox.com/scl/fi/7tmylmiza62oj597uxhfx/Timelapse3.zip?rlkey=zlfxfix394n3iivwit8qe2tdu&st=njmpa38n&dl=1)
+[Download Pre-Compiled Signed ACAP (zip)](https://www.dropbox.com/scl/fi/7tmylmiza62oj597uxhfx/Timelapse3.zip?rlkey=zlfxfix394n3iivwit8qe2tdu&st=njmpa38n&dl=1)
 
 ## Support This Project
 
