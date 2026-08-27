@@ -1291,17 +1291,8 @@ static void AppendQueryParameterEncoded(char* query, size_t query_size, const ch
 }
 
 void FormatCoordinates(double lat, double lon, char* latBuffer, size_t latSize, char* lonBuffer, size_t lonSize) {
-    // Format latitude: DD.DDDD
-    snprintf(latBuffer, latSize, "%.8f", lat);
-
-    // Format longitude: DDD.DDDD (with leading zero if necessary)
-    if (lon >= 0 && lon < 100) {
-        snprintf(lonBuffer, lonSize, "0%.8f", lon); // Add leading zero for positive two-digit longitude
-    } else if (lon > -100 && lon < 0) {
-        snprintf(lonBuffer, lonSize, "-0%.8f", -lon); // Add leading zero for negative two-digit longitude
-    } else {
-        snprintf(lonBuffer, lonSize, "%.8f", lon); // No leading zero needed for three-digit longitude
-    }
+    snprintf(latBuffer, latSize, "%+012.8f", lat);
+    snprintf(lonBuffer, lonSize, "%+013.8f", lon);
 }
 
 int SetLocationData(cJSON* location) {

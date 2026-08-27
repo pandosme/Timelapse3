@@ -100,6 +100,7 @@ HTTP_Endpoint_Reset(const ACAP_HTTP_Response response,
 
 static GMainLoop *main_loop = NULL;
 static int services_started = 0;
+static int storage_initialized = 0;
 
 static gboolean update_storage_status(gpointer user_data);
 
@@ -149,39 +150,31 @@ static gboolean update_storage_status(gpointer user_data) {
 	return G_SOURCE_CONTINUE;
 }
 
-static gboolean delayed_Init(gpointer user_data) {
-	int dir_ok = 0;
-	char error_message[256];
-	LOG("SD Card will be initializing\n");
-
-	LOG("Check SD Card\n");
-	dir_ok = storage_ensure_root(error_message, sizeof(error_message));
-	if (dir_ok) {
-		LOG("Directory verified: %s", storage_root());
-		ACAP_STATUS_SetBool("sdcard","present",1);
-		ACAP_STATUS_SetString("sdcard","message","");
-	} else {
-		LOG_WARN("%s", error_message);
-		ACAP_STATUS_SetBool("sdcard","present",0);
-		ACAP_STATUS_SetString("sdcard","message",error_message);
+static void storage_initialized_callback(int available, const char* message, void* user_data) {
+	(void)user_data;
+	if (!available) {
+		LOG_WARN("SD card unavailable: %s\n", message);
+		ACAP_STATUS_SetBool("sdcard", "present", 0);
+		ACAP_STATUS_SetString("sdcard", "message", message);
+		return;
 	}
 
-    // 3. Update status and handle services
-    if (dir_ok) {
-		update_storage_status(NULL);
-		Migration_Init(migration_complete);
-		if (Migration_Is_Pending()) {
-			LOG("Legacy migration pending; recording services paused\n");
-			ACAP_STATUS_SetString("app", "status", "Waiting for AVI migration decision");
-		} else {
-			start_services();
-		}
-    } else {
-        LOG_WARN("Cannot initialize services - directory unavailable");
-    }
+	ACAP_STATUS_SetBool("sdcard", "present", 1);
+	ACAP_STATUS_SetString("sdcard", "message", "");
+	update_storage_status(NULL);
+	if (storage_initialized) {
+		return;
+	}
+	storage_initialized = 1;
+	LOG("SD Disk path: %s\n", storage_base());
 
-    LOG("SD Card OK\n");
-    return G_SOURCE_REMOVE;
+	Migration_Init(migration_complete);
+	if (Migration_Is_Pending()) {
+		LOG("Legacy migration pending; recording services paused\n");
+		ACAP_STATUS_SetString("app", "status", "Waiting for AVI migration decision");
+	} else {
+		start_services();
+	}
 }
 
 int main(void) {
@@ -195,11 +188,11 @@ int main(void) {
 	//Last resort for a corrupt file system on SD Card
     ACAP_HTTP_Node("reset", HTTP_Endpoint_Reset);
 
-	LOG("SD Card will be initialized in 10 seconds\n");
-		g_timeout_add_seconds(30, update_storage_status, NULL);
+	LOG("Initializing SD card through Axis Storage API\n");
+	g_timeout_add_seconds(30, update_storage_status, NULL);
 	ACAP_STATUS_SetBool("sdcard","present",0);
-	ACAP_STATUS_SetString("sdcard","message","Intializaing SD Card");
-	g_timeout_add_seconds(6, delayed_Init, NULL);
+	ACAP_STATUS_SetString("sdcard","message","Initializing SD card");
+	storage_initialize_async(storage_initialized_callback, NULL);
 
     // Create and run the main loop
 	main_loop = g_main_loop_new(NULL, FALSE);
@@ -216,6 +209,11 @@ int main(void) {
     g_main_loop_run(main_loop);
 	LOG("------ Exit %s ------\n",APP_PACKAGE);
     ACAP_Cleanup();
+    if (ACAP_Background_Jobs_Wait(0) == 0) {
+		storage_cleanup();
+	} else {
+		LOG_WARN("Storage retained because background jobs are still running\n");
+	}
     closelog();
     return 0;
 }

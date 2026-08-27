@@ -154,23 +154,25 @@ inline `<script>` block. Edit it directly; there's no bundler/transpiler in fron
 
 ## Storage layout on the camera
 
-`storage_ensure_root()` (`storage.c`) resolves the actual root at startup by searching, in order,
-for an existing `timelapse2` directory: the modern AXIS "storage areas" path
-(`/var/spool/storage/areas/SD_DISK/root`), the legacy path (`/var/spool/storage/SD_DISK`), then a
-uid-scoped variant of the legacy path. Whichever one already has a `timelapse2` directory wins, so
-upgrades and firmware differences don't strand a camera's existing data; if none exists yet
-(fresh install), it creates one in the first candidate that's actually writable, same order.
-**There is deliberately no internal-flash fallback** — recordings only ever belong on the SD card;
-if no candidate is usable, `storage_ensure_root()` fails and the app reports no SD card rather than
-silently writing somewhere small and non-persistent. (An internal-flash fallback existed briefly
-and was removed after it caused exactly that: silent recording into
-`/usr/local/packages/timelapse2/localdata`, which is wiped on a full uninstall/reinstall — see git
-history around the storage.c rewrite if you need the postmortem.) The two real AXIS OS mount
-layouts differ by device/firmware: some only bind-mount the SD card at the legacy path, some only
-at the areas path, and some (older/other firmware) dual-mount it at both.
+`storage_initialize_async()` (`storage.c`) follows Axis's official Axstorage example: list
+connected storage, subscribe to `SD_DISK` status events, set it up asynchronously when available
+and writable, obtain the application directory with `ax_storage_get_path()`, and release then
+unsubscribe during shutdown. The Axstorage path is authoritative; never reinstate fixed-path or
+writability probing as the active storage selector.
+
+Axstorage normally returns `/var/spool/storage/areas/SD_DISK/timelapse2`, because the API creates
+an application-specific directory. The app derives the parent solely to log `SD Disk path:
+/var/spool/storage/areas/SD_DISK`. No absolute mount path is hard-coded. For upgrade compatibility,
+if `<Axstorage SD Disk path>/root/timelapse2` already exists, the app keeps using it in place; no
+files are migrated. Otherwise it uses the application directory returned by Axstorage. This works
+whether firmware exposes an additional `/var/spool/storage/SD_DISK` alias or not.
+
+`storage_ensure_root()` no longer discovers the SD Disk; it only verifies the root selected beneath
+the Axstorage-derived base and rejects writes while the API reports unavailable, read-only, full,
+or exiting. There is deliberately no internal-flash fallback.
 
 ```
-<SD card>/timelapse2/                           (path varies - see storage_ensure_root() above)
+<Axstorage SD Disk path>/{root/,}timelapse2/      (existing layout retained without migration)
   profiles.json                                 timelapse profile definitions
   recordings.json                               recording_store state (frame counts, byte totals, fps, ...)
   profiles/<profileId>/
