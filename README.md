@@ -278,7 +278,6 @@ The About page shows:
 - Fixed preview generation when a recording's cache directory does not yet exist.
 - Ensure the correct path on SD Card.
 - Warns when the selected resolution is expected to exceed the camera's available encoding memory and predicts the reduced MP4 resolution.
-- Documents that supported MP4 resolution depends on camera model, camera mode, and available resources.
 
 ### 3.1.6
 - Fixed previews, exports and archives failing immediately on cameras with limited available memory.
