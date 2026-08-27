@@ -262,6 +262,7 @@ let mediaJobProgress = 0;
 let mediaJobKind = '';
 let mediaJobCompleteToast = 'Recording updated and media processing completed.';
 let mediaJobFallbackToast = 'Recording updated.';
+let mediaJobCompleteToastType = 'success';
 let profileFormBaseline = '';
 let closeOnMediaJobComplete = false;
 let mediaJobSeenActive = false;
@@ -311,9 +312,10 @@ function hideBusy() {
 function showToast(message, type) {
     const toast = $('#feedbackToast');
     const isError = type === 'error';
+    const isSuccess = type === 'success';
     toast.stop(true, true);
     toast.toggleClass('tl-toast-error', isError);
-    toast.toggleClass('tl-toast-success', !isError);
+    toast.toggleClass('tl-toast-success', isSuccess);
     toast.text(message || 'Done').fadeIn(120);
     if (toastTimer) {
         clearTimeout(toastTimer);
@@ -321,7 +323,7 @@ function showToast(message, type) {
     toastTimer = setTimeout(function() {
         toast.fadeOut(220);
         toastTimer = null;
-    }, 3000);
+    }, type === 'warning' ? 9000 : 3000);
 }
 
 function stopMediaJobPolling() {
@@ -628,7 +630,7 @@ function pollMediaJobStatus() {
                     hideBusy();
                     hideModal('timelapseModal');
                     loadRecordings();
-                    showToast(message, failed ? 'error' : 'success');
+                    showToast(message, failed ? 'error' : mediaJobCompleteToastType);
                 }, 500);
             } else if (closeOnMediaJobComplete && !mediaJobSeenActive && Date.now() >= mediaJobWaitDeadlineMs) {
                 mediaJobStage = 'Processing complete';
@@ -640,7 +642,7 @@ function pollMediaJobStatus() {
                     hideBusy();
                     hideModal('timelapseModal');
                     loadRecordings();
-                    showToast(mediaJobFallbackToast, 'success');
+                    showToast(mediaJobFallbackToast, mediaJobCompleteToastType);
                 }, 300);
             }
         },
@@ -659,6 +661,7 @@ function startMediaJobPolling() {
     mediaJobKind = '';
     mediaJobCompleteToast = 'Recording updated and media processing completed.';
     mediaJobFallbackToast = 'Recording updated.';
+    mediaJobCompleteToastType = 'success';
     closeOnMediaJobComplete = false;
     mediaJobSeenActive = false;
     mediaJobWaitDeadlineMs = 0;
@@ -1164,11 +1167,17 @@ function saveProfile(e) {
         type: 'POST',
         url: 'timelapse',
         contentType: 'application/json',
+        dataType: 'json',
         data: JSON.stringify(formData),
-        success: function() {
+        success: function(response) {
             if (expectBackgroundReencode) {
                 showBusy('Updating media for FPS change...');
                 startMediaJobPolling();
+                if (response && response.warning) {
+                    mediaJobCompleteToast = response.warning;
+                    mediaJobFallbackToast = response.warning;
+                    mediaJobCompleteToastType = 'warning';
+                }
                 mediaJobStage = 'Re-encoding export for FPS change';
                 closeOnMediaJobComplete = true;
                 mediaJobWaitDeadlineMs = Date.now() + 4000;
@@ -1177,7 +1186,11 @@ function saveProfile(e) {
 
             hideModal('timelapseModal');
             loadRecordings();
-            showToast('Recording settings saved.', 'success');
+            if (response && response.warning) {
+                showToast(response.warning, 'warning');
+            } else {
+                showToast('Recording settings saved.', 'success');
+            }
         },
         error: function() {
             closeOnMediaJobComplete = false;

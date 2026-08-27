@@ -8,6 +8,7 @@
 
 int media_ffmpeg_available(void);
 const char* media_last_error(void);
+int media_resolution_advisory(int width, int height, char* message, size_t message_len);
 int media_job_try_admit(void);
 void media_job_release(void);
 int media_job_is_active(void);

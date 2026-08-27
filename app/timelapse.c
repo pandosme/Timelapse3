@@ -830,6 +830,7 @@ void Timelapse_Reset(void) {
         LOG("%s: Services not started, nothing to reset\n", __func__);
         return;
     }
+
     Run_On_Main_Thread(Reset_Task, NULL);
 }
 
@@ -878,6 +879,16 @@ static void Handle_Profile_Write(const ACAP_HTTP_Response response, const ACAP_H
         return;
     }
 
+    char resolution_warning[384] = "";
+    int resolution_width = 0;
+    int resolution_height = 0;
+    char trailing = '\0';
+    if (sscanf(resolutionItem->valuestring, "%dx%d%c",
+               &resolution_width, &resolution_height, &trailing) == 2) {
+        media_resolution_advisory(resolution_width, resolution_height,
+                                  resolution_warning, sizeof(resolution_warning));
+    }
+
     char id[PROFILE_ID_MAX];
     g_strlcpy(id, idItem->valuestring, sizeof(id));
 
@@ -917,7 +928,17 @@ static void Handle_Profile_Write(const ACAP_HTTP_Response response, const ACAP_H
     if (had_existing_profile && old_fps != new_fps) {
         Queue_Reencode_Export(id, old_fps, new_fps);
     }
-    ACAP_HTTP_Respond_Text(response, what);
+    cJSON* result = cJSON_CreateObject();
+    if (!result) {
+        ACAP_HTTP_Respond_Text(response, what);
+        return;
+    }
+    cJSON_AddStringToObject(result, "message", what);
+    if (resolution_warning[0]) {
+        cJSON_AddStringToObject(result, "warning", resolution_warning);
+    }
+    ACAP_HTTP_Respond_JSON(response, result);
+    cJSON_Delete(result);
 }
 
 static void HTTP_Endpoint_Timelapse(const ACAP_HTTP_Response response, const ACAP_HTTP_Request request) {

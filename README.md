@@ -29,6 +29,10 @@ Please report bugs and other issues [here](https://github.com/pandosme/Timelapse
 - SD card storage enabled on the camera.
 - Administrator access to install and configure the ACAP.
 
+The maximum practical MP4 resolution depends on the camera model, active camera mode, other
+analytics and applications, and memory available when encoding starts. A resolution exposed by
+the camera can therefore be too large for that camera's current resource budget.
+
 Timelapse V3 version 3.x supports aarch64 only.
 
 If your camera is armv7hf-based, stay on Timelapse2 version 2.x.
@@ -184,6 +188,12 @@ Each recording can be configured with:
 - Archive cadence
 - Expected images per day
 
+When saving a recording, Timelapse estimates the memory required to encode the selected
+resolution. If it exceeds the camera's current safe memory budget, the interface warns about the
+predicted MP4 resolution. Captured JPEG images remain at the selected resolution; only generated
+MP4 previews, exports, and archives may be scaled down. The estimate can change when camera mode
+or other running applications change.
+
 ### Trigger Types
 
 **Event based** captures when the selected camera event is triggered.
@@ -263,6 +273,19 @@ The About page shows:
 ---
 
 ## History
+
+### 3.1.7
+- Fixed preview generation when a recording's cache directory does not yet exist.
+- Ensure the correct path on SD Card.
+- Warns when the selected resolution is expected to exceed the camera's available encoding memory and predicts the reduced MP4 resolution.
+- Documents that supported MP4 resolution depends on camera model, camera mode, and available resources.
+
+### 3.1.6
+- Fixed previews, exports and archives failing immediately on cameras with limited available memory.
+- Fixed some valid latitude and longitude values being rejected when saving sun-event settings.
+
+### 3.1.5
+- Maintenance release.
 
 ### 3.1.4
 - Improved thread safety for recording, archive, preview, export and reset operations.

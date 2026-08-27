@@ -4,7 +4,6 @@
 #include <glib.h>
 #include <signal.h>
 #include <poll.h>
-#include <sys/resource.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -406,6 +405,37 @@ static void pick_encode_dimensions(int source_width, int source_height, int* out
     *out_height = height;
 }
 
+int media_resolution_advisory(int width, int height, char* message, size_t message_len) {
+    if (!message || message_len == 0) {
+        return 0;
+    }
+    message[0] = '\0';
+
+    int budget_mb = encode_memory_budget_mb();
+    int required_mb = estimate_encode_peak_mb(width, height);
+    if (width <= 0 || height <= 0 || budget_mb <= 0 || required_mb <= budget_mb) {
+        return 0;
+    }
+
+    int encode_width = width;
+    int encode_height = height;
+    pick_encode_dimensions(width, height, &encode_width, &encode_height);
+    int fallback_required_mb = estimate_encode_peak_mb(encode_width, encode_height);
+    if ((encode_width != width || encode_height != height) && fallback_required_mb <= budget_mb) {
+        snprintf(message, message_len,
+                 "Camera memory may limit %dx%d MP4 video to %dx%d "
+                 "(estimated need %d MB; current safe budget %d MB). Captured images remain %dx%d.",
+                 width, height, encode_width, encode_height, required_mb, budget_mb, width, height);
+    } else {
+        snprintf(message, message_len,
+                 "Camera memory may be insufficient for %dx%d MP4 video "
+                 "(estimated need %d MB; current safe budget %d MB; lowest predicted useful output %dx%d). "
+                 "Captured images remain %dx%d.",
+                 width, height, required_mb, budget_mb, encode_width, encode_height, width, height);
+    }
+    return 1;
+}
+
 /* Preview, export and archive segments get concatenated into each other with
    "-c copy" (see the merge steps below), and an MP4 carries ONE parameter set for
    the whole track. So every segment must be encoded with identical x264 settings:
@@ -513,25 +543,6 @@ static long read_proc_status_kb(pid_t pid, const char* key) {
     return value_kb;
 }
 
-/* Runs between fork and exec, so only async-signal-safe calls belong here. The address
-   space cap is a backstop for what the 250 ms poll cannot see: an allocation burst that
-   starts and finishes between two samples. It is deliberately loose - the field report
-   above shows 1.0 GB of address space behind 613 MB of RSS, mostly thread stacks and
-   allocator arenas that are never faulted in - because a cap that bites a healthy encode
-   costs a video for nothing. */
-typedef struct {
-    rlim_t address_space_bytes;
-} ChildLimits;
-
-static void apply_child_limits(gpointer user_data) {
-    const ChildLimits* limits = (const ChildLimits*)user_data;
-    if (!limits || limits->address_space_bytes == 0) {
-        return;
-    }
-    struct rlimit limit = { limits->address_space_bytes, limits->address_space_bytes };
-    setrlimit(RLIMIT_AS, &limit);
-}
-
 /* One sample of a running child against what the device can still spare. Returns non-zero
    when this child has to go: either it is over the budget its resolution was chosen for,
    or the device as a whole is close enough to empty that the next fork could fail.
@@ -569,16 +580,11 @@ static gboolean run_ffmpeg_guarded(char** argv, int budget_mb, const char* what,
                                    FfmpegRun* run, GError** error) {
     memset(run, 0, sizeof(*run));
 
-    ChildLimits limits = { 0 };
-    if (budget_mb > 0) {
-        limits.address_space_bytes = (rlim_t)budget_mb * 2 * 1024 * 1024;
-    }
-
     GPid child_pid = 0;
     gint stderr_fd = -1;
     if (!g_spawn_async_with_pipes(NULL, argv, NULL,
                                   G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL,
-                                  apply_child_limits, &limits, &child_pid,
+                                  NULL, NULL, &child_pid,
                                   NULL, NULL, &stderr_fd, error)) {
         return FALSE;
     }
@@ -1919,6 +1925,11 @@ int media_generate_preview(const char* profile_id, int fps, char* out_path, size
 
     g_mutex_lock(&encode_mutex);
 
+    if (!ensure_cache_dir(profile_id)) {
+        g_mutex_unlock(&encode_mutex);
+        return 0;
+    }
+
     // Export processing may have run while this preview waited for the encoder, replacing
     // the base video and deleting raw frames. Re-read every input that determines the merge
     // range under the lock so the preview cannot be built from a stale pre-lock snapshot.
@@ -2423,9 +2434,8 @@ int media_convert_avi_to_mp4(const char* input_path, const char* output_path, Me
     int low_memory_samples = 0;
     long peak_rss_kb = 0;
     int guard_killed = 0;
-    ChildLimits limits = { budget_mb > 0 ? (rlim_t)budget_mb * 2 * 1024 * 1024 : 0 };
     gboolean ok = g_spawn_async_with_pipes(NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD,
-                                          apply_child_limits, &limits,
+                                          NULL, NULL,
                                           &child_pid, NULL, &stdout_fd, NULL, &spawn_error);
     if (!ok) {
         set_last_error("FFmpeg AVI migration failed: %s", spawn_error ? spawn_error->message : "unknown error");
