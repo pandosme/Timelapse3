@@ -192,7 +192,9 @@ When saving a recording, Timelapse estimates the memory required to encode the s
 resolution. If it exceeds the camera's current safe memory budget, the interface warns about the
 predicted MP4 resolution. Captured JPEG images remain at the selected resolution; only generated
 MP4 previews, exports, and archives may be scaled down. The estimate can change when camera mode
-or other running applications change.
+or other running applications change. The smaller FFmpeg executable introduced in 3.1.8 reduces
+the app's installed storage footprint, but the selected resolution and encoder frame buffers still
+determine the memory needed to create MP4 video.
 
 ### Trigger Types
 
@@ -273,6 +275,9 @@ The About page shows:
 ---
 
 ## History
+
+### 3.1.8
+- Reduced the bundled FFmpeg executable by enabling only the media formats, codecs, filters and protocols used by Timelapse.
 
 ### 3.1.7
 - Fixed preview generation when a recording's cache directory does not yet exist.

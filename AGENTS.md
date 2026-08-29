@@ -39,8 +39,10 @@ for that arch. `third_party/ffmpeg/armv7hf/` is left in place in case that chang
 
 `Dockerfile` pulls `axisecp/acap-native-sdk:<version>-<arch>-ubuntuXX.XX`, copies `app/` in, copies
 a prebuilt `ffmpeg` binary from `third_party/ffmpeg/<arch>/ffmpeg` into `bin/`, and runs
-`acap-build`. **The build hard-fails if that ffmpeg binary is missing** — it's not fetched or
-built as part of this pipeline, it must already be present in `third_party/ffmpeg/<arch>/`.
+`acap-build`. **The app build hard-fails if that ffmpeg binary is missing** — it is not rebuilt as
+part of the normal pipeline. The checked-in AArch64 binary can be reproduced separately with
+`./tools/ffmpeg/build.sh`; that build pins FFmpeg/x264 revisions and verifies the minimal component
+set before replacing `third_party/ffmpeg/aarch64/ffmpeg`.
 
 If you don't have Docker / can't run the real build, you can still sanity-check pure-logic changes
 (no glib/ACAP dependency) by extracting the function(s) into a standalone harness and compiling
