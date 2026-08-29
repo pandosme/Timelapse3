@@ -423,13 +423,15 @@ int media_resolution_advisory(int width, int height, char* message, size_t messa
     int fallback_required_mb = estimate_encode_peak_mb(encode_width, encode_height);
     if ((encode_width != width || encode_height != height) && fallback_required_mb <= budget_mb) {
         snprintf(message, message_len,
-                 "Camera memory may limit %dx%d MP4 video to %dx%d "
-                 "(estimated need %d MB; current safe budget %d MB). Captured images remain %dx%d.",
+                 "Camera memory may limit the selected %dx%d MP4 video to %dx%d "
+                 "(estimated need %d MB; current safe budget %d MB). The smaller FFmpeg package saves storage; "
+                 "resolution still drives encoding memory. Captured images remain %dx%d.",
                  width, height, encode_width, encode_height, required_mb, budget_mb, width, height);
     } else {
         snprintf(message, message_len,
-                 "Camera memory may be insufficient for %dx%d MP4 video "
+                 "Camera memory may be insufficient for the selected %dx%d MP4 video "
                  "(estimated need %d MB; current safe budget %d MB; lowest predicted useful output %dx%d). "
+                 "The smaller FFmpeg package saves storage; resolution still drives encoding memory. "
                  "Captured images remain %dx%d.",
                  width, height, required_mb, budget_mb, encode_width, encode_height, width, height);
     }
